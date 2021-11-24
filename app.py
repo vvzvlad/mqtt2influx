@@ -31,12 +31,15 @@ def upload_to_influx(topic, payload):
 
 
 def parse_json(json_string, topic):
-  json_object = json.loads(json_string)
-  for key in json_object:
-    topic_m = topic + '/' + key
-    value = json_object[key]
-    #print('JN: ' + topic_m + '=' + str(value))
-    parse_message(topic_m, value)
+  try:
+    json_object = json.loads(json_string)
+    for key in json_object:
+      topic_m = topic + '/' + key
+      value = json_object[key]
+      #print('JN: ' + topic_m + '=' + str(value))
+      parse_message(topic_m, value)
+  except:
+    print('JSON parse error: ' + json_string)
 
 def parse_message(topic, payload):
   is_number = test_number(payload)
@@ -45,13 +48,13 @@ def parse_message(topic, payload):
   #print(is_number, is_json, topic, payload)
 
   if is_number == True:
-    #print('N: '+ topic +'=' + str(payload))
+    print('N: '+ topic +'=' + str(payload))
     upload_to_influx(topic, payload)
   elif is_json == True and is_number == False:
     #print('J: '+ topic +'=' + payload)
     parse_json(payload, topic)
-  #elif is_number == False and is_json == False:
-    #print('T: '+ topic +'=' + str(payload))
+  elif is_number == False and is_json == False:
+    print('T: '+ topic +'=' + str(payload))
     #upload_to_influx(topic, payload)
 
 
