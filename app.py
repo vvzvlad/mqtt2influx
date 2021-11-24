@@ -39,7 +39,7 @@ def parse_json(json_string, topic):
       #print('JN: ' + topic_m + '=' + str(value))
       parse_message(topic_m, value)
   except:
-    print('JSON parse error: ' + json_string)
+    print('JSON parse error: ' + topic + ":" + json_string)
 
 def parse_message(topic, payload):
   is_number = test_number(payload)
@@ -50,6 +50,14 @@ def parse_message(topic, payload):
   if is_number == True:
     print('N: '+ topic +'=' + str(payload))
     upload_to_influx(topic, payload)
+  elif payload == "true" or payload == "false":
+    print('B2: ' + topic + '=' + str(payload))
+    if payload == "true":
+      payload = 1
+    else:
+      payload = 0
+    upload_to_influx(topic, payload)
+
   elif is_json == True and is_number == False:
     #print('J: '+ topic +'=' + payload)
     parse_json(payload, topic)
