@@ -27,7 +27,10 @@ def test_json(value):
 
 def upload_to_influx(topic, payload):
     json_body = [ { "measurement": topic, "fields": { "value": float(payload) } } ]
-    influx_client.write_points(json_body)
+    try:
+      influx_client.write_points(json_body)
+    except:
+      os.exit()
 
 
 def parse_json(json_string, topic):
@@ -45,11 +48,12 @@ def parse_message(topic, payload):
   is_number = test_number(payload)
   is_json = test_json(payload)
 
-  #print(is_number, is_json, topic, payload)
+  print(is_number, is_json, topic, payload)
 
   if is_number == True:
     print('N: '+ topic +'=' + str(payload))
-    upload_to_influx(topic, payload)
+    if topic.find("linkquality") == -1:
+      upload_to_influx(topic, payload)
   elif payload == "true" or payload == "false":
     print('B2: ' + topic + '=' + str(payload))
     if payload == "true":
@@ -60,7 +64,10 @@ def parse_message(topic, payload):
 
   elif is_json == True and is_number == False:
     #print('J: '+ topic +'=' + payload)
-    parse_json(payload, topic)
+    try:
+      parse_json(payload, topic)
+    except:
+      os.exit()
   elif is_number == False and is_json == False:
     print('T: '+ topic +'=' + str(payload))
     #upload_to_influx(topic, payload)
@@ -71,30 +78,35 @@ def on_connect(client, userdata, flags, rc):
   client.subscribe("#")
   client.publish("mqtt2influx/status", payload="mqtt2influx daemon started", qos=0, retain=False)
 
-
 def on_message(client, userdata, msg):
   if msg.retain == False:
-    parse_message(msg.topic, msg.payload.decode("utf-8"))
+    try:
+      parse_message(msg.topic, msg.payload.decode("utf-8"))
+    except:
+      os.exit()
   #print(msg.topic + ": " + msg.payload.decode("utf-8"))
 
 def main():
   global influx_client
-  influx_client = InfluxDBClient('192.168.88.111', 8086, 'root', 'root', 'smarthome')
-  influx_client.create_database('smarthome')
   counter = 0
   period = 60
   client = mqtt.Client()
-  client.on_connect = on_connect
-  client.on_message = on_message
-  client.connect("192.168.88.111", 1883, 60)
-  time.sleep(5)
-  client.loop_start()
-  while True:
-    uptime = counter * period
-    client.publish("mqtt2influx/status/uptime", str(uptime), qos=0, retain=False)
-    time.sleep(period)
-    counter = counter + 1
-  client.loop_stop()
+  try:
+    influx_client = InfluxDBClient('192.168.88.111', 8086, 'root', 'root', 'smarthome')
+    influx_client.create_database('smarthome')
+    client.on_connect = on_connect
+    client.on_message = on_message
+    client.connect("192.168.88.111", 1883, 60)
+    time.sleep(5)
+    client.loop_start()
+    while True:
+      uptime = counter * period
+      client.publish("mqtt2influx/status/uptime", str(uptime), qos=0, retain=True)
+      time.sleep(period)
+      counter = counter + 1
+    client.loop_stop()
+  except:
+    os.exit()
 
 
 
