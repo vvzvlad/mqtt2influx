@@ -77,7 +77,6 @@ def on_connect(client, userdata, flags, rc):
   print("Connected with result code "+str(rc))
   client.subscribe("#")
   client.publish("mqtt2influx/status", payload="mqtt2influx daemon started", qos=0, retain=False)
-  client.on_disconnect = on_disconnect
 
 def on_message(client, userdata, msg):
   if msg.retain == False:
@@ -87,7 +86,7 @@ def on_message(client, userdata, msg):
       sys.exit()
   #print(msg.topic + ": " + msg.payload.decode("utf-8"))
 
-def on_message(client, userdata, msg):
+def on_disconnect(client, userdata, msg):
   print("disconnected, exit")
   sys.exit()
 
@@ -101,7 +100,7 @@ def main():
     influx_client.create_database('smarthome')
     mqtt_client.on_connect = on_connect
     mqtt_client.on_message = on_message
-
+    mqtt_client.on_disconnect = on_disconnect
     mqtt_client.connect("192.168.88.111", 1883, 10)
     time.sleep(5)
     mqtt_client.loop_start()
