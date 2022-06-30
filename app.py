@@ -86,25 +86,29 @@ def on_message(client, userdata, msg):
       sys.exit()
   #print(msg.topic + ": " + msg.payload.decode("utf-8"))
 
+def on_message(client, userdata, msg):
+  sys.exit()
+
 def main():
   global influx_client
   counter = 0
   period = 60
-  client = mqtt.Client()
+  mqtt_client = mqtt.Client()
   try:
     influx_client = InfluxDBClient('192.168.88.111', 8086, 'root', 'root', 'smarthome')
     influx_client.create_database('smarthome')
-    client.on_connect = on_connect
-    client.on_message = on_message
-    client.connect("192.168.88.111", 1883, 60)
+    mqtt_client.on_connect = on_connect
+    mqtt_client.on_message = on_message
+    mqtt_client.on_disconnect = on_disconnect
+    mqtt_client.connect("192.168.88.111", 1883, 10)
     time.sleep(5)
-    client.loop_start()
+    mqtt_client.loop_start()
     while True:
       uptime = counter * period
-      client.publish("mqtt2influx/status/uptime", str(uptime), qos=0, retain=True)
+      mqtt_client.publish("mqtt2influx/status/uptime", str(uptime), qos=0, retain=True)
       time.sleep(period)
       counter = counter + 1
-    client.loop_stop()
+    mqtt_client.loop_stop()
   except:
     sys.exit()
 
