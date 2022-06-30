@@ -30,7 +30,7 @@ def upload_to_influx(topic, payload):
     try:
       influx_client.write_points(json_body)
     except:
-      os.exit()
+      sys.exit()
 
 
 def parse_json(json_string, topic):
@@ -67,7 +67,7 @@ def parse_message(topic, payload):
     try:
       parse_json(payload, topic)
     except:
-      os.exit()
+      sys.exit()
   elif is_number == False and is_json == False:
     print('T: '+ topic +'=' + str(payload))
     #upload_to_influx(topic, payload)
@@ -83,7 +83,7 @@ def on_message(client, userdata, msg):
     try:
       parse_message(msg.topic, msg.payload.decode("utf-8"))
     except:
-      os.exit()
+      sys.exit()
   #print(msg.topic + ": " + msg.payload.decode("utf-8"))
 
 def main():
@@ -106,7 +106,7 @@ def main():
       counter = counter + 1
     client.loop_stop()
   except:
-    os.exit()
+    sys.exit()
 
 
 
