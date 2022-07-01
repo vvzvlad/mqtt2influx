@@ -30,7 +30,7 @@ def upload_to_influx(topic, payload):
     try:
       influx_client.write_points(json_body)
     except:
-      sys.exit()
+      os.system('reboot')
 
 
 def parse_json(json_string, topic):
@@ -67,7 +67,7 @@ def parse_message(topic, payload):
     try:
       parse_json(payload, topic)
     except:
-      sys.exit()
+      os.system('reboot')
   elif is_number == False and is_json == False:
     print('T: '+ topic +'=' + str(payload))
     #upload_to_influx(topic, payload)
@@ -83,12 +83,12 @@ def on_message(client, userdata, msg):
     try:
       parse_message(msg.topic, msg.payload.decode("utf-8"))
     except:
-      sys.exit()
+      os.system('reboot')
   #print(msg.topic + ": " + msg.payload.decode("utf-8"))
 
 def on_disconnect(client, userdata, msg):
   print("disconnected, exit")
-  sys.exit()
+  os.system('reboot')
 
 def main():
   global influx_client
@@ -111,7 +111,7 @@ def main():
       counter = counter + 1
     mqtt_client.loop_stop()
   except:
-    sys.exit()
+    os.system('reboot')
 
 
 
