@@ -76,7 +76,9 @@
   .modal-footer { display: flex; gap: 10px; justify-content: flex-end; margin-top: 20px; }
   .empty-state { display: flex; align-items: center; justify-content: center; height: 100%; color: var(--muted); flex-direction: column; gap: 8px; }
   .no-streams { display: flex; align-items: center; justify-content: center; height: 120px; color: var(--muted); font-size: 12px; }
-  .stream-actions { display: flex; gap: 6px; margin-top: 6px; }
+  .stream-actions { display: flex; gap: 4px; margin-top: 6px; }
+  .btn-stop { background: rgba(239,68,68,.15); color: var(--red); }
+  .btn-start { background: rgba(34,197,94,.15); color: var(--green); }
   .log-stream-badge { font-size: 10px; color: var(--yellow); flex-shrink: 0; }
 </style>
 </head>
@@ -283,11 +285,19 @@ function renderStreamList() {
       ? '<span class="badge badge-green">running</span>'
       : '<span class="badge badge-red">stopped</span>';
     const active = id === selectedId ? ' active' : '';
+    const toggleBtn = running
+      ? `<button class="btn btn-stop btn-sm" onclick="toggleStream('${id}',event)">Stop</button>`
+      : `<button class="btn btn-start btn-sm" onclick="toggleStream('${id}',event)">Start</button>`;
     return `<div class="stream-item${active}" onclick="selectStream('${id}')">
       <div style="display:flex;align-items:center;gap:8px;">
         <span class="stream-name">${escHtml(autoName(s))}</span>${badge}
       </div>
       <div class="stream-meta">${escHtml(s.mqtt_host)}:${s.mqtt_port} → ${escHtml(s.influx_host)}/${escHtml(s.influx_database)}</div>
+      <div class="stream-actions">
+        ${toggleBtn}
+        <button class="btn btn-ghost btn-sm" onclick="editStream('${id}',event)">Edit</button>
+        <button class="btn btn-ghost btn-sm" onclick="copyStream('${id}',event)">Copy</button>
+      </div>
     </div>`;
   }).join('');
 }
@@ -372,6 +382,27 @@ async function saveStream() {
 function editSelected() {
   if (!selectedId) return;
   openModal(streams[selectedId]);
+}
+
+function editStream(id, event) {
+  event.stopPropagation();
+  openModal(streams[id]);
+}
+
+function copyStream(id, event) {
+  event.stopPropagation();
+  const src = { ...streams[id] };
+  delete src.id;
+  src.name = '';
+  openModal(src);  // editingId stays null → creates new
+}
+
+async function toggleStream(id, event) {
+  event.stopPropagation();
+  const s = streams[id];
+  const action = s.running ? 'stop' : 'start';
+  await fetch(`/api/streams/${id}/${action}`, { method: 'POST' });
+  await loadStreams();
 }
 
 async function deleteSelected() {
