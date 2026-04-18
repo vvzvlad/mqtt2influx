@@ -89,6 +89,7 @@
   .progress-bar { height: 100%; background: var(--accent); border-radius: 4px; transition: width .4s; }
   .flush-ok { color: var(--green); }
   .flush-err { color: var(--red); }
+  .pause-badge { font-size: 11px; color: var(--yellow); cursor: pointer; margin-left: auto; }
 </style>
 </head>
 <body>
@@ -151,6 +152,7 @@
       <div class="log-panel">
         <div class="log-header">
           <div class="panel-title">Live message flow</div>
+          <span id="logPauseIndicator" class="pause-badge" style="display:none" onclick="resumeLog()">⏸ <span id="pendingCount">0</span> pending — click to resume</span>
           <button class="btn btn-ghost btn-sm" onclick="clearLog()">Clear</button>
         </div>
         <div class="log-body" id="logBody"></div>
@@ -226,9 +228,11 @@ let streams = {};      // id -> stream config+running
 let statsMap = {};     // id -> stats
 let selectedId = null;
 let editingId = null;
-const MAX_LOG = 200;
-let logEntries = [];   // all entries; filtered by selectedId for display
+const MAX_LOG = 5000;   // in-memory buffer per all streams
+const DOM_MAX_LOG = 1000; // max entries in DOM
 let allLogEntries = [];
+let logPaused = false;
+let pendingLog = [];
 
 function connectWS() {
   const proto = location.protocol === 'https:' ? 'wss' : 'ws';
@@ -257,33 +261,63 @@ function connectWS() {
 function handleLiveMessage(streamId, data) {
   const entry = { streamId, ...data };
   allLogEntries.push(entry);
-  if (allLogEntries.length > MAX_LOG * 3) allLogEntries.shift();
+  if (allLogEntries.length > MAX_LOG) allLogEntries.shift();
 
   if (selectedId === streamId) {
-    appendLogEntry(entry);
+    if (logPaused) {
+      pendingLog.push(entry);
+      updatePauseIndicator();
+    } else {
+      appendLogEntry(entry);
+    }
   }
+}
+
+function isAtBottom() {
+  const body = document.getElementById('logBody');
+  return body.scrollHeight - body.scrollTop - body.clientHeight < 50;
+}
+
+function updatePauseIndicator() {
+  const el = document.getElementById('logPauseIndicator');
+  if (logPaused) {
+    el.style.display = '';
+    document.getElementById('pendingCount').textContent = pendingLog.length;
+  } else {
+    el.style.display = 'none';
+  }
+}
+
+function resumeLog() {
+  logPaused = false;
+  const body = document.getElementById('logBody');
+  pendingLog.forEach(e => appendLogEntryDOM(body, e));
+  pendingLog = [];
+  updatePauseIndicator();
+  body.scrollTop = body.scrollHeight;
 }
 
 function appendLogEntry(entry) {
   const body = document.getElementById('logBody');
+  appendLogEntryDOM(body, entry);
+  body.scrollTop = body.scrollHeight;
+}
+
+function appendLogEntryDOM(body, entry) {
   const div = document.createElement('div');
   div.className = 'log-entry';
   const ts = new Date(entry.ts);
   const hms = ts.toTimeString().slice(0,8) + '.' + String(ts.getMilliseconds()).padStart(3,'0');
-  div.innerHTML = `
-    <span class="log-ts">${hms}</span>
-    <span class="log-topic" title="${entry.topic}">${entry.topic}</span>
-    <span class="log-value">${entry.value}</span>
-  `;
+  div.innerHTML = `<span class="log-ts">${hms}</span><span class="log-topic" title="${escHtml(entry.topic)}">${escHtml(entry.topic)}</span><span class="log-value">${entry.value}</span>`;
   body.appendChild(div);
-  // keep max
-  while (body.children.length > MAX_LOG) body.removeChild(body.firstChild);
-  body.scrollTop = body.scrollHeight;
+  while (body.children.length > DOM_MAX_LOG) body.removeChild(body.firstChild);
 }
 
 function clearLog() {
   document.getElementById('logBody').innerHTML = '';
   allLogEntries = allLogEntries.filter(e => e.streamId !== selectedId);
+  pendingLog = pendingLog.filter(e => e.streamId !== selectedId);
+  updatePauseIndicator();
 }
 
 async function loadStreams() {
@@ -373,6 +407,9 @@ function renderStats() {
 
 function selectStream(id) {
   selectedId = id;
+  logPaused = false;
+  pendingLog = [];
+  updatePauseIndicator();
   renderStreamList();
 
   const s = streams[id];
@@ -381,10 +418,13 @@ function selectStream(id) {
   content.style.display = 'flex';
   document.getElementById('contentTitle').textContent = autoName(s);
 
-  // repopulate log
+  // repopulate log from buffer
   const body = document.getElementById('logBody');
   body.innerHTML = '';
-  allLogEntries.filter(e => e.streamId === id).forEach(appendLogEntry);
+  const entries = allLogEntries.filter(e => e.streamId === id);
+  const start = Math.max(0, entries.length - DOM_MAX_LOG);
+  entries.slice(start).forEach(e => appendLogEntryDOM(body, e));
+  body.scrollTop = body.scrollHeight;
 
   renderStats();
 }
