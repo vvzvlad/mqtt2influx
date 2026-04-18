@@ -5,6 +5,7 @@
 import asyncio
 import json
 import logging
+import os
 import time
 from typing import Callable, Optional
 
@@ -15,8 +16,8 @@ from .config import StreamConfig
 
 logger = logging.getLogger(__name__)
 
-BATCH_SIZE = 200
-BATCH_INTERVAL = 2.0  # seconds
+BATCH_SIZE = int(os.environ.get("BATCH_SIZE", "100"))
+BATCH_INTERVAL = float(os.environ.get("BATCH_INTERVAL", "1.0"))
 
 
 class StreamProcessor:
