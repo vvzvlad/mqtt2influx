@@ -530,6 +530,17 @@ document.getElementById('overlay').addEventListener('click', e => {
   if (e.target === e.currentTarget) closeModal();
 });
 
+document.getElementById('logBody').addEventListener('scroll', () => {
+  if (isAtBottom()) {
+    if (logPaused) resumeLog();
+  } else {
+    if (!logPaused) {
+      logPaused = true;
+      updatePauseIndicator();
+    }
+  }
+});
+
 connectWS();
 loadStreams();
 </script>
