@@ -34,6 +34,7 @@ class StreamProcessor:
         self.errors = 0
         self.last_topics: list = []  # rolling last 20 topics
         self.batch_current = 0
+        self.batches_sent = 0
         self.last_flush_time: float = 0.0
         self.last_flush_count: int = 0
         self.last_flush_ok: bool = True
@@ -81,6 +82,7 @@ class StreamProcessor:
             self.last_flush_ok = ok
             if ok:
                 self.points_sent += count
+                self.batches_sent += 1
                 await self.on_event(self.cfg.id, "flush", {"count": count, "status": "ok"})
             else:
                 self.errors += 1
@@ -171,6 +173,7 @@ class StreamProcessor:
             "errors": self.errors,
             "last_topics": list(self.last_topics),
             "batch_current": self.batch_current,
+            "batches_sent": self.batches_sent,
             "batch_max": BATCH_SIZE,
             "batch_interval": BATCH_INTERVAL,
             "last_flush_time": self.last_flush_time,

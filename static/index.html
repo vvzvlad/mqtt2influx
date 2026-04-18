@@ -144,6 +144,7 @@
             </div>
             <div style="color:var(--muted);font-size:11px;" id="lastFlushTime">—</div>
             <div style="margin-top:4px;color:var(--text);font-size:12px;" id="lastFlushCount">—</div>
+            <div style="margin-top:6px;color:var(--muted);font-size:11px;">sent <span id="batchesSent" style="color:var(--text)">0</span> batches · avg <span id="batchAvg" style="color:var(--text)">—</span> pts</div>
           </div>
         </div>
       </div>
@@ -358,10 +359,15 @@ function renderStats() {
     const secsAgo = Math.round((Date.now() - ft * 1000) / 1000);
     document.getElementById('lastFlushTime').textContent = `${hms}  (${secsAgo}s ago)`;
     document.getElementById('lastFlushCount').textContent = `${s.last_flush_count ?? 0} points`;
+    const bs = s.batches_sent ?? 0;
+    document.getElementById('batchesSent').textContent = bs;
+    document.getElementById('batchAvg').textContent = bs > 0 ? Math.round((s.points_sent ?? 0) / bs) : '—';
   } else {
     document.getElementById('lastFlushStatus').textContent = '—';
     document.getElementById('lastFlushTime').textContent = 'no flushes yet';
     document.getElementById('lastFlushCount').textContent = '';
+    document.getElementById('batchesSent').textContent = '0';
+    document.getElementById('batchAvg').textContent = '—';
   }
 }
 
