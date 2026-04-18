@@ -45,7 +45,7 @@
   .content { display: flex; flex-direction: column; overflow: hidden; }
   .panel { padding: 16px 20px; border-bottom: 1px solid var(--border); }
   .panel-title { font-size: 11px; font-weight: 600; text-transform: uppercase; letter-spacing: .08em; color: var(--muted); margin-bottom: 10px; }
-  .stats-grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 10px; }
+  .stats-grid { display: grid; grid-template-columns: repeat(4, 1fr); gap: 10px; }
   .stat-box { background: var(--surface); border-radius: 8px; padding: 10px 14px; border: 1px solid var(--border); }
   .stat-label { color: var(--muted); font-size: 11px; }
   .stat-value { font-size: 22px; font-weight: 700; color: var(--accent); margin-top: 2px; }
@@ -80,6 +80,15 @@
   .btn-stop { background: rgba(239,68,68,.15); color: var(--red); }
   .btn-start { background: rgba(34,197,94,.15); color: var(--green); }
   .log-stream-badge { font-size: 10px; color: var(--yellow); flex-shrink: 0; }
+  .batch-panel { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; margin-top: 10px; }
+  .batch-box { background: var(--surface); border-radius: 8px; padding: 10px 14px; border: 1px solid var(--border); }
+  .batch-row { display: flex; align-items: center; justify-content: space-between; margin-bottom: 6px; }
+  .batch-label { color: var(--muted); font-size: 11px; }
+  .batch-val { font-size: 13px; font-weight: 600; color: var(--text); }
+  .progress-wrap { background: var(--border); border-radius: 4px; height: 6px; overflow: hidden; }
+  .progress-bar { height: 100%; background: var(--accent); border-radius: 4px; transition: width .4s; }
+  .flush-ok { color: var(--green); }
+  .flush-err { color: var(--red); }
 </style>
 </head>
 <body>
@@ -118,6 +127,24 @@
           <div class="stat-box"><div class="stat-label">Filtered</div><div class="stat-value" id="statFiltered">0</div></div>
           <div class="stat-box"><div class="stat-label">Points sent</div><div class="stat-value" id="statSent">0</div></div>
           <div class="stat-box"><div class="stat-label">Errors</div><div class="stat-value" id="statErrors" style="color:var(--red)">0</div></div>
+        </div>
+        <div class="batch-panel">
+          <div class="batch-box">
+            <div class="batch-row">
+              <span class="batch-label">Current batch</span>
+              <span class="batch-val"><span id="batchCurrent">0</span> / <span id="batchMax">—</span></span>
+            </div>
+            <div class="progress-wrap"><div class="progress-bar" id="batchBar" style="width:0%"></div></div>
+            <div style="margin-top:6px; color:var(--muted); font-size:11px;">max <span id="cfgBatchSize">—</span> pts · timeout <span id="cfgBatchInterval">—</span> s</div>
+          </div>
+          <div class="batch-box">
+            <div class="batch-row">
+              <span class="batch-label">Last flush</span>
+              <span class="batch-val" id="lastFlushStatus">—</span>
+            </div>
+            <div style="color:var(--muted);font-size:11px;" id="lastFlushTime">—</div>
+            <div style="margin-top:4px;color:var(--text);font-size:12px;" id="lastFlushCount">—</div>
+          </div>
         </div>
       </div>
       <div class="log-panel">
@@ -310,6 +337,32 @@ function renderStats() {
   document.getElementById('statFiltered').textContent = s.msgs_filtered ?? 0;
   document.getElementById('statSent').textContent = s.points_sent ?? 0;
   document.getElementById('statErrors').textContent = s.errors ?? 0;
+
+  // batch fill
+  const cur = s.batch_current ?? 0;
+  const max = s.batch_max ?? 200;
+  document.getElementById('batchCurrent').textContent = cur;
+  document.getElementById('batchMax').textContent = max;
+  document.getElementById('batchBar').style.width = (max > 0 ? Math.round(cur / max * 100) : 0) + '%';
+  document.getElementById('cfgBatchSize').textContent = max;
+  document.getElementById('cfgBatchInterval').textContent = s.batch_interval ?? '—';
+
+  // last flush
+  const ft = s.last_flush_time;
+  if (ft) {
+    const ok = s.last_flush_ok;
+    document.getElementById('lastFlushStatus').className = 'batch-val ' + (ok ? 'flush-ok' : 'flush-err');
+    document.getElementById('lastFlushStatus').textContent = ok ? 'OK' : 'ERROR';
+    const d = new Date(ft * 1000);
+    const hms = d.toTimeString().slice(0, 8);
+    const secsAgo = Math.round((Date.now() - ft * 1000) / 1000);
+    document.getElementById('lastFlushTime').textContent = `${hms}  (${secsAgo}s ago)`;
+    document.getElementById('lastFlushCount').textContent = `${s.last_flush_count ?? 0} points`;
+  } else {
+    document.getElementById('lastFlushStatus').textContent = '—';
+    document.getElementById('lastFlushTime').textContent = 'no flushes yet';
+    document.getElementById('lastFlushCount').textContent = '';
+  }
 }
 
 function selectStream(id) {
@@ -355,19 +408,27 @@ function closeModal() {
 }
 
 async function saveStream() {
+  const mqttHost = document.getElementById('fMqttHost').value.trim();
+  const influxHost = document.getElementById('fInfluxHost').value.trim();
+  const influxDb = document.getElementById('fInfluxDb').value.trim();
+
+  if (!mqttHost) { alert('MQTT Host is required'); document.getElementById('fMqttHost').focus(); return; }
+  if (!influxHost) { alert('InfluxDB Host is required'); document.getElementById('fInfluxHost').focus(); return; }
+  if (!influxDb) { alert('InfluxDB Database is required'); document.getElementById('fInfluxDb').focus(); return; }
+
   const body = {
     name: document.getElementById('fName').value.trim(),
-    mqtt_host: document.getElementById('fMqttHost').value.trim(),
+    mqtt_host: mqttHost,
     mqtt_port: parseInt(document.getElementById('fMqttPort').value) || 1883,
     mqtt_user: document.getElementById('fMqttUser').value.trim(),
     mqtt_password: document.getElementById('fMqttPass').value,
     mqtt_topic: document.getElementById('fMqttTopic').value.trim() || '#',
     topic_prefix: document.getElementById('fTopicPrefix').value.trim(),
-    influx_host: document.getElementById('fInfluxHost').value.trim(),
+    influx_host: influxHost,
     influx_port: parseInt(document.getElementById('fInfluxPort').value) || 8086,
     influx_user: document.getElementById('fInfluxUser').value.trim(),
     influx_password: document.getElementById('fInfluxPass').value,
-    influx_database: document.getElementById('fInfluxDb').value.trim(),
+    influx_database: influxDb,
     enabled: true,
   };
 

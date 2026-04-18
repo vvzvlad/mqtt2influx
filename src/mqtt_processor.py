@@ -32,6 +32,10 @@ class StreamProcessor:
         self.points_sent = 0
         self.errors = 0
         self.last_topics: list = []  # rolling last 20 topics
+        self.batch_current = 0
+        self.last_flush_time: float = 0.0
+        self.last_flush_count: int = 0
+        self.last_flush_ok: bool = True
 
     def start(self):
         self._running = True
@@ -69,8 +73,11 @@ class StreamProcessor:
             nonlocal batch, last_flush
             if not batch:
                 return
-            ok = await writer.write_batch(batch)
             count = len(batch)
+            ok = await writer.write_batch(batch)
+            self.last_flush_time = time.time()
+            self.last_flush_count = count
+            self.last_flush_ok = ok
             if ok:
                 self.points_sent += count
                 await self.on_event(self.cfg.id, "flush", {"count": count, "status": "ok"})
@@ -78,6 +85,7 @@ class StreamProcessor:
                 self.errors += 1
                 await self.on_event(self.cfg.id, "flush", {"count": count, "status": "error"})
             batch = []
+            self.batch_current = 0
             last_flush = time.monotonic()
 
         while self._running:
@@ -126,6 +134,7 @@ class StreamProcessor:
                         for flat_topic, value in flatten_payload(full_topic, payload):
                             ts_ms = int(time.time() * 1000)
                             batch.append((flat_topic, value, ts_ms))
+                            self.batch_current = len(batch)
 
                             self.last_topics.append({"topic": flat_topic, "value": value, "ts": ts_ms})
                             if len(self.last_topics) > 20:
@@ -160,4 +169,10 @@ class StreamProcessor:
             "points_sent": self.points_sent,
             "errors": self.errors,
             "last_topics": list(self.last_topics),
+            "batch_current": self.batch_current,
+            "batch_max": BATCH_SIZE,
+            "batch_interval": BATCH_INTERVAL,
+            "last_flush_time": self.last_flush_time,
+            "last_flush_count": self.last_flush_count,
+            "last_flush_ok": self.last_flush_ok,
         }
