@@ -98,7 +98,7 @@ class InfluxWriter:
                 if resp.status in (200, 204):
                     return True
                 text = await resp.text()
-                logger.error("[%s] InfluxDB error %s: %s", self.stream_id, resp.status, text)
+                logger.error("[%s] InfluxDB error %s: %s | url=%s params=%s body=%s", self.stream_id, resp.status, text, self.url, self.params, body[:500])
                 return False
         except Exception as e:
             logger.error("[%s] InfluxDB write failed: %s", self.stream_id, e)
