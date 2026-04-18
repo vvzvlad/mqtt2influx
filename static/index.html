@@ -1,0 +1,399 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>mqtt2influx</title>
+<style>
+  :root {
+    --bg: #0f1117;
+    --surface: #1a1d27;
+    --border: #2a2d3a;
+    --accent: #4f8ef7;
+    --green: #22c55e;
+    --red: #ef4444;
+    --yellow: #f59e0b;
+    --text: #e2e8f0;
+    --muted: #64748b;
+    --font: 'JetBrains Mono', 'Fira Code', 'Cascadia Code', monospace;
+  }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body { background: var(--bg); color: var(--text); font-family: var(--font); font-size: 13px; }
+  header { display: flex; align-items: center; gap: 12px; padding: 14px 20px; border-bottom: 1px solid var(--border); }
+  header h1 { font-size: 16px; font-weight: 600; color: var(--accent); }
+  .ws-dot { width: 8px; height: 8px; border-radius: 50%; background: var(--red); transition: background .3s; margin-left: auto; }
+  .ws-dot.ok { background: var(--green); }
+  .main { display: grid; grid-template-columns: 340px 1fr; height: calc(100vh - 49px); }
+  .sidebar { border-right: 1px solid var(--border); display: flex; flex-direction: column; overflow: hidden; }
+  .sidebar-header { display: flex; align-items: center; justify-content: space-between; padding: 12px 14px; border-bottom: 1px solid var(--border); }
+  .sidebar-header span { font-weight: 600; color: var(--muted); text-transform: uppercase; font-size: 11px; letter-spacing: .08em; }
+  .btn { border: none; border-radius: 6px; padding: 6px 12px; cursor: pointer; font-family: var(--font); font-size: 12px; font-weight: 600; transition: opacity .2s; }
+  .btn:hover { opacity: .85; }
+  .btn-primary { background: var(--accent); color: #fff; }
+  .btn-danger { background: var(--red); color: #fff; }
+  .btn-sm { padding: 3px 8px; font-size: 11px; }
+  .btn-ghost { background: var(--border); color: var(--text); }
+  .stream-list { flex: 1; overflow-y: auto; }
+  .stream-item { padding: 10px 14px; border-bottom: 1px solid var(--border); cursor: pointer; transition: background .15s; }
+  .stream-item:hover { background: var(--surface); }
+  .stream-item.active { background: var(--surface); border-left: 3px solid var(--accent); }
+  .stream-name { font-weight: 600; }
+  .stream-meta { color: var(--muted); font-size: 11px; margin-top: 2px; }
+  .badge { display: inline-block; padding: 1px 6px; border-radius: 4px; font-size: 10px; font-weight: 700; }
+  .badge-green { background: rgba(34,197,94,.15); color: var(--green); }
+  .badge-red { background: rgba(239,68,68,.15); color: var(--red); }
+  .content { display: flex; flex-direction: column; overflow: hidden; }
+  .panel { padding: 16px 20px; border-bottom: 1px solid var(--border); }
+  .panel-title { font-size: 11px; font-weight: 600; text-transform: uppercase; letter-spacing: .08em; color: var(--muted); margin-bottom: 10px; }
+  .stats-grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 10px; }
+  .stat-box { background: var(--surface); border-radius: 8px; padding: 10px 14px; border: 1px solid var(--border); }
+  .stat-label { color: var(--muted); font-size: 11px; }
+  .stat-value { font-size: 22px; font-weight: 700; color: var(--accent); margin-top: 2px; }
+  .log-panel { flex: 1; overflow: hidden; display: flex; flex-direction: column; }
+  .log-header { display: flex; align-items: center; gap: 10px; padding: 10px 20px; border-bottom: 1px solid var(--border); }
+  .log-header .panel-title { margin: 0; }
+  .log-body { flex: 1; overflow-y: auto; padding: 8px 20px; font-size: 12px; }
+  .log-entry { display: flex; gap: 10px; padding: 3px 0; border-bottom: 1px solid rgba(255,255,255,.03); }
+  .log-ts { color: var(--muted); flex-shrink: 0; width: 90px; }
+  .log-topic { color: var(--accent); flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .log-value { color: var(--green); flex-shrink: 0; text-align: right; min-width: 70px; }
+  .right-panel { display: flex; flex-direction: column; overflow: hidden; }
+  /* Modal */
+  .overlay { display: none; position: fixed; inset: 0; background: rgba(0,0,0,.6); z-index: 100; align-items: center; justify-content: center; }
+  .overlay.open { display: flex; }
+  .modal { background: var(--surface); border: 1px solid var(--border); border-radius: 12px; width: 520px; max-height: 90vh; overflow-y: auto; padding: 24px; }
+  .modal h2 { margin-bottom: 18px; font-size: 15px; }
+  .form-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
+  .form-group { display: flex; flex-direction: column; gap: 4px; }
+  .form-group.full { grid-column: 1/-1; }
+  label { font-size: 11px; color: var(--muted); font-weight: 600; text-transform: uppercase; letter-spacing: .06em; }
+  input[type=text], input[type=number], input[type=password] {
+    background: var(--bg); border: 1px solid var(--border); border-radius: 6px;
+    color: var(--text); font-family: var(--font); font-size: 13px; padding: 7px 10px;
+    outline: none; width: 100%;
+  }
+  input:focus { border-color: var(--accent); }
+  .modal-footer { display: flex; gap: 10px; justify-content: flex-end; margin-top: 20px; }
+  .empty-state { display: flex; align-items: center; justify-content: center; height: 100%; color: var(--muted); flex-direction: column; gap: 8px; }
+  .no-streams { display: flex; align-items: center; justify-content: center; height: 120px; color: var(--muted); font-size: 12px; }
+  .stream-actions { display: flex; gap: 6px; margin-top: 6px; }
+  .log-stream-badge { font-size: 10px; color: var(--yellow); flex-shrink: 0; }
+</style>
+</head>
+<body>
+
+<header>
+  <h1>mqtt2influx</h1>
+  <div class="ws-dot" id="wsDot" title="WebSocket"></div>
+</header>
+
+<div class="main">
+  <div class="sidebar">
+    <div class="sidebar-header">
+      <span>Streams</span>
+      <button class="btn btn-primary btn-sm" onclick="openModal()">+ Add</button>
+    </div>
+    <div class="stream-list" id="streamList">
+      <div class="no-streams">No streams configured</div>
+    </div>
+  </div>
+
+  <div class="right-panel">
+    <div id="noSelection" class="empty-state" style="flex:1">
+      <div>Select a stream to see metrics</div>
+    </div>
+    <div id="streamContent" style="display:none; flex:1; flex-direction:column; overflow:hidden; display:none;">
+      <div class="panel">
+        <div style="display:flex; align-items:center; justify-content:space-between; margin-bottom:10px;">
+          <div class="panel-title" id="contentTitle">Stream</div>
+          <div style="display:flex;gap:8px;">
+            <button class="btn btn-ghost btn-sm" onclick="editSelected()">Edit</button>
+            <button class="btn btn-danger btn-sm" onclick="deleteSelected()">Delete</button>
+          </div>
+        </div>
+        <div class="stats-grid">
+          <div class="stat-box"><div class="stat-label">Received</div><div class="stat-value" id="statReceived">0</div></div>
+          <div class="stat-box"><div class="stat-label">Filtered</div><div class="stat-value" id="statFiltered">0</div></div>
+          <div class="stat-box"><div class="stat-label">Points sent</div><div class="stat-value" id="statSent">0</div></div>
+          <div class="stat-box"><div class="stat-label">Errors</div><div class="stat-value" id="statErrors" style="color:var(--red)">0</div></div>
+        </div>
+      </div>
+      <div class="log-panel">
+        <div class="log-header">
+          <div class="panel-title">Live message flow</div>
+          <button class="btn btn-ghost btn-sm" onclick="clearLog()">Clear</button>
+        </div>
+        <div class="log-body" id="logBody"></div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- Modal -->
+<div class="overlay" id="overlay">
+  <div class="modal">
+    <h2 id="modalTitle">Add Stream</h2>
+    <div class="form-grid">
+      <div class="form-group full">
+        <label>Name</label>
+        <input type="text" id="fName" placeholder="My stream">
+      </div>
+      <div class="form-group">
+        <label>MQTT Host</label>
+        <input type="text" id="fMqttHost" placeholder="192.168.1.1">
+      </div>
+      <div class="form-group">
+        <label>MQTT Port</label>
+        <input type="number" id="fMqttPort" value="1883">
+      </div>
+      <div class="form-group">
+        <label>MQTT User</label>
+        <input type="text" id="fMqttUser">
+      </div>
+      <div class="form-group">
+        <label>MQTT Password</label>
+        <input type="password" id="fMqttPass">
+      </div>
+      <div class="form-group full">
+        <label>MQTT Topic (subscription)</label>
+        <input type="text" id="fMqttTopic" placeholder="#">
+      </div>
+      <div class="form-group full">
+        <label>Topic Prefix (added to measurement path)</label>
+        <input type="text" id="fTopicPrefix" placeholder="home">
+      </div>
+      <div class="form-group">
+        <label>InfluxDB Host</label>
+        <input type="text" id="fInfluxHost" placeholder="192.168.1.2">
+      </div>
+      <div class="form-group">
+        <label>InfluxDB Port</label>
+        <input type="number" id="fInfluxPort" value="8086">
+      </div>
+      <div class="form-group">
+        <label>InfluxDB User</label>
+        <input type="text" id="fInfluxUser">
+      </div>
+      <div class="form-group">
+        <label>InfluxDB Password</label>
+        <input type="password" id="fInfluxPass">
+      </div>
+      <div class="form-group full">
+        <label>InfluxDB Database</label>
+        <input type="text" id="fInfluxDb" placeholder="home">
+      </div>
+    </div>
+    <div class="modal-footer">
+      <button class="btn btn-ghost" onclick="closeModal()">Cancel</button>
+      <button class="btn btn-primary" onclick="saveStream()">Save</button>
+    </div>
+  </div>
+</div>
+
+<script>
+let ws = null;
+let streams = {};      // id -> stream config+running
+let statsMap = {};     // id -> stats
+let selectedId = null;
+let editingId = null;
+const MAX_LOG = 200;
+let logEntries = [];   // all entries; filtered by selectedId for display
+let allLogEntries = [];
+
+function connectWS() {
+  const proto = location.protocol === 'https:' ? 'wss' : 'ws';
+  ws = new WebSocket(`${proto}://${location.host}/ws`);
+  ws.onopen = () => document.getElementById('wsDot').classList.add('ok');
+  ws.onclose = () => {
+    document.getElementById('wsDot').classList.remove('ok');
+    setTimeout(connectWS, 3000);
+  };
+  ws.onmessage = (e) => {
+    const msg = JSON.parse(e.data);
+    if (msg.type === 'snapshot') {
+      msg.data.forEach(s => { statsMap[s.id] = s; });
+      renderStats();
+    } else if (msg.type === 'stats') {
+      msg.data.forEach(s => { statsMap[s.id] = s; });
+      renderStats();
+    } else if (msg.type === 'message') {
+      handleLiveMessage(msg.stream_id, msg.data);
+    } else if (msg.type === 'flush') {
+      // ignore here, stats covers it
+    }
+  };
+}
+
+function handleLiveMessage(streamId, data) {
+  const entry = { streamId, ...data };
+  allLogEntries.push(entry);
+  if (allLogEntries.length > MAX_LOG * 3) allLogEntries.shift();
+
+  if (selectedId === streamId) {
+    appendLogEntry(entry);
+  }
+}
+
+function appendLogEntry(entry) {
+  const body = document.getElementById('logBody');
+  const div = document.createElement('div');
+  div.className = 'log-entry';
+  const ts = new Date(entry.ts);
+  const hms = ts.toTimeString().slice(0,8) + '.' + String(ts.getMilliseconds()).padStart(3,'0');
+  div.innerHTML = `
+    <span class="log-ts">${hms}</span>
+    <span class="log-topic" title="${entry.topic}">${entry.topic}</span>
+    <span class="log-value">${entry.value}</span>
+  `;
+  body.appendChild(div);
+  // keep max
+  while (body.children.length > MAX_LOG) body.removeChild(body.firstChild);
+  body.scrollTop = body.scrollHeight;
+}
+
+function clearLog() {
+  document.getElementById('logBody').innerHTML = '';
+  allLogEntries = allLogEntries.filter(e => e.streamId !== selectedId);
+}
+
+async function loadStreams() {
+  const res = await fetch('/api/streams');
+  const list = await res.json();
+  streams = {};
+  list.forEach(s => streams[s.id] = s);
+  renderStreamList();
+  renderStats();
+}
+
+function autoName(s) {
+  return s.name || `${s.mqtt_host}:${s.mqtt_port} ${s.mqtt_topic}`;
+}
+
+function renderStreamList() {
+  const el = document.getElementById('streamList');
+  const ids = Object.keys(streams);
+  if (!ids.length) {
+    el.innerHTML = '<div class="no-streams">No streams configured</div>';
+    return;
+  }
+  el.innerHTML = ids.map(id => {
+    const s = streams[id];
+    const running = s.running;
+    const badge = running
+      ? '<span class="badge badge-green">running</span>'
+      : '<span class="badge badge-red">stopped</span>';
+    const active = id === selectedId ? ' active' : '';
+    return `<div class="stream-item${active}" onclick="selectStream('${id}')">
+      <div style="display:flex;align-items:center;gap:8px;">
+        <span class="stream-name">${escHtml(autoName(s))}</span>${badge}
+      </div>
+      <div class="stream-meta">${escHtml(s.mqtt_host)}:${s.mqtt_port} → ${escHtml(s.influx_host)}/${escHtml(s.influx_database)}</div>
+    </div>`;
+  }).join('');
+}
+
+function renderStats() {
+  if (!selectedId) return;
+  const s = statsMap[selectedId];
+  if (!s) return;
+  document.getElementById('statReceived').textContent = s.msgs_received ?? 0;
+  document.getElementById('statFiltered').textContent = s.msgs_filtered ?? 0;
+  document.getElementById('statSent').textContent = s.points_sent ?? 0;
+  document.getElementById('statErrors').textContent = s.errors ?? 0;
+}
+
+function selectStream(id) {
+  selectedId = id;
+  renderStreamList();
+
+  const s = streams[id];
+  document.getElementById('noSelection').style.display = 'none';
+  const content = document.getElementById('streamContent');
+  content.style.display = 'flex';
+  document.getElementById('contentTitle').textContent = autoName(s);
+
+  // repopulate log
+  const body = document.getElementById('logBody');
+  body.innerHTML = '';
+  allLogEntries.filter(e => e.streamId === id).forEach(appendLogEntry);
+
+  renderStats();
+}
+
+function openModal(prefill) {
+  editingId = prefill ? prefill.id : null;
+  document.getElementById('modalTitle').textContent = editingId ? 'Edit Stream' : 'Add Stream';
+  const f = prefill || {};
+  document.getElementById('fName').value = f.name || '';
+  document.getElementById('fMqttHost').value = f.mqtt_host || '';
+  document.getElementById('fMqttPort').value = f.mqtt_port ?? 1883;
+  document.getElementById('fMqttUser').value = f.mqtt_user || '';
+  document.getElementById('fMqttPass').value = f.mqtt_password || '';
+  document.getElementById('fMqttTopic').value = f.mqtt_topic || '#';
+  document.getElementById('fTopicPrefix').value = f.topic_prefix || '';
+  document.getElementById('fInfluxHost').value = f.influx_host || '';
+  document.getElementById('fInfluxPort').value = f.influx_port ?? 8086;
+  document.getElementById('fInfluxUser').value = f.influx_user || '';
+  document.getElementById('fInfluxPass').value = f.influx_password || '';
+  document.getElementById('fInfluxDb').value = f.influx_database || '';
+  document.getElementById('overlay').classList.add('open');
+}
+
+function closeModal() {
+  document.getElementById('overlay').classList.remove('open');
+  editingId = null;
+}
+
+async function saveStream() {
+  const body = {
+    name: document.getElementById('fName').value.trim(),
+    mqtt_host: document.getElementById('fMqttHost').value.trim(),
+    mqtt_port: parseInt(document.getElementById('fMqttPort').value) || 1883,
+    mqtt_user: document.getElementById('fMqttUser').value.trim(),
+    mqtt_password: document.getElementById('fMqttPass').value,
+    mqtt_topic: document.getElementById('fMqttTopic').value.trim() || '#',
+    topic_prefix: document.getElementById('fTopicPrefix').value.trim(),
+    influx_host: document.getElementById('fInfluxHost').value.trim(),
+    influx_port: parseInt(document.getElementById('fInfluxPort').value) || 8086,
+    influx_user: document.getElementById('fInfluxUser').value.trim(),
+    influx_password: document.getElementById('fInfluxPass').value,
+    influx_database: document.getElementById('fInfluxDb').value.trim(),
+    enabled: true,
+  };
+
+  const method = editingId ? 'PUT' : 'POST';
+  const url = editingId ? `/api/streams/${editingId}` : '/api/streams';
+  await fetch(url, { method, headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
+  closeModal();
+  await loadStreams();
+  if (editingId) selectStream(editingId);
+}
+
+function editSelected() {
+  if (!selectedId) return;
+  openModal(streams[selectedId]);
+}
+
+async function deleteSelected() {
+  if (!selectedId) return;
+  if (!confirm(`Delete stream "${streams[selectedId].name || selectedId}"?`)) return;
+  await fetch(`/api/streams/${selectedId}`, { method: 'DELETE' });
+  selectedId = null;
+  document.getElementById('noSelection').style.display = '';
+  document.getElementById('streamContent').style.display = 'none';
+  await loadStreams();
+}
+
+function escHtml(s) {
+  return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+}
+
+document.getElementById('overlay').addEventListener('click', e => {
+  if (e.target === e.currentTarget) closeModal();
+});
+
+connectWS();
+loadStreams();
+</script>
+</body>
+</html>

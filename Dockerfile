@@ -9,4 +9,7 @@ COPY main.py .
 COPY src/ ./src/
 COPY static/ ./static/
 
+ENV DATA_DIR=/data
+VOLUME ["/data"]
+
 CMD ["python", "main.py"]
