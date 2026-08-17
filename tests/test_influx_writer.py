@@ -170,6 +170,35 @@ def test_rounding_to_two_decimals_flattens_small_readings_to_zero():
     assert to_number(1e-9) == 0.0
 
 
+@pytest.mark.parametrize("value", [
+    float("nan"), float("inf"), float("-inf"),   # json.loads accepts NaN and Infinity by default
+    "nan", "NaN", "inf", "-inf", "Infinity",     # and float() parses all of these from a payload
+    1e400,                                       # overflows to inf on the way in
+])
+def test_a_value_influxdb_cannot_parse_is_dropped_like_a_status_string(value):
+    """NaN and the infinities are not a rounding curiosity, they are a batch-killer.
+
+    `make_line` would render `value=nan`, and InfluxDB 1.x scans a field value that starts with
+    neither a digit nor a sign as an invalid number and rejects the WHOLE request body. One sensor
+    publishing "nan" — which is what a probe with no reading publishes — therefore costs the other
+    219 points batched with it, and then a full retry ladder against a 400 that will answer the
+    same way forever. Dropping them here rewrites no history: no value like this has ever been
+    stored, because InfluxDB never accepted one.
+    """
+    assert to_number(value) is None
+
+
+def test_an_integer_too_large_for_a_float_is_dropped_rather_than_raising():
+    """json.loads() parses an integer of any length; float() refuses one that does not fit.
+
+    The OverflowError has no handler between here and `_process_forever`'s outer `except
+    Exception`, so it would be counted as a stream error and cost a five-second reconnect sleep —
+    during which the broker publishes to a subscriber that is not there. One device with a
+    400-digit number in its payload would throttle the entire stream.
+    """
+    assert to_number(10 ** 400) is None
+
+
 def test_a_bool_yields_a_python_int_while_a_number_yields_a_float():
     """The two branches return different Python types, and that leaks all the way out.
 
@@ -416,6 +445,70 @@ async def test_credentials_are_attached_when_a_user_is_configured():
     assert await writer.write_batch([("m", 1.0, 1)]) is True
 
     assert session.calls[0]["auth"] == aiohttp.BasicAuth("influx-user", "influx-secret")
+
+
+# ── write_batch_detailed: which failures are worth repeating ──────────────────────────────────────
+
+@pytest.mark.parametrize("status", [429, 500, 502, 503, 504])
+async def test_a_failure_that_a_second_attempt_could_fix_says_so(status):
+    """The database being overloaded, restarting, or behind a proxy that is: the same body sent a
+    second later can succeed, and this is the whole reason the retry ladder exists."""
+    writer, _session = _writer_with_fake_session(_FakeResponse(status=status, text="boom"))
+
+    assert await writer.write_batch_detailed([("m", 1.0, 1)]) == (False, True)
+
+
+@pytest.mark.parametrize("status", [400, 401, 403, 404, 405, 413, 422])
+async def test_a_failure_that_will_answer_the_same_way_forever_says_so(status):
+    """A rotated password, a dropped database, a NaN the line parser refuses.
+
+    Collapsed into a bare `False`, each of these ran the whole ladder: one 10s aiohttp timeout plus
+    the full RETRY_BUDGET per batch, spent by a message loop that is meanwhile taking nothing out
+    of the broker's queue — roughly 15 seconds per 220 points, on every batch, until a human
+    noticed. The answer was guaranteed identical every time.
+    """
+    writer, _session = _writer_with_fake_session(_FakeResponse(status=status, text="boom"))
+
+    assert await writer.write_batch_detailed([("m", 1.0, 1)]) == (False, False)
+
+
+@pytest.mark.parametrize("status", [200, 204])
+async def test_a_stored_batch_is_never_offered_for_a_retry(status):
+    writer, _session = _writer_with_fake_session(_FakeResponse(status=status))
+
+    assert await writer.write_batch_detailed([("m", 1.0, 1)]) == (True, False)
+
+
+async def test_an_empty_batch_is_stored_without_a_request_and_without_a_retry():
+    writer, session = _writer_with_fake_session()
+
+    assert await writer.write_batch_detailed([]) == (True, False)
+    assert session.calls == []
+
+
+@pytest.mark.parametrize("error", [
+    aiohttp.ClientConnectionError("cannot connect to influx.example:8086"),
+    TimeoutError(),
+    aiohttp.ClientPayloadError("truncated response"),
+])
+async def test_a_network_failure_is_always_worth_repeating(error):
+    """Nothing about the request was ever judged — it did not arrive. Classifying a refused
+    connection or a DNS blip as permanent would drop the batch on the first blip, which is the bug
+    the ladder was added to fix."""
+    writer, _session = _writer_with_fake_session(_ExplodingResponse(error))
+
+    assert await writer.write_batch_detailed([("m", 1.0, 1)]) == (False, True)
+
+
+async def test_write_batch_stays_a_plain_bool_over_the_detailed_answer():
+    """The bool shape is what the shutdown flush and every writer double in the suite are written
+    against. Widening it would be a silent change to a contract nothing else in the codebase
+    declares, so it is pinned here rather than assumed."""
+    writer, _session = _writer_with_fake_session(_FakeResponse(status=204))
+    assert await writer.write_batch([("m", 1.0, 1)]) is True
+
+    writer, _session = _writer_with_fake_session(_FakeResponse(status=401, text="nope"))
+    assert await writer.write_batch([("m", 1.0, 1)]) is False
 
 
 async def test_no_auth_header_is_sent_when_no_user_is_configured():
