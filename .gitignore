@@ -1,10 +1,26 @@
 __pycache__/
 *.py[cod]
+*.so
 .venv/
 venv/
+ENV/
+env/
 .pytest_cache/
 .DS_Store
+logs/
+
+# The first secret anyone needs locally lands here, and this repository is public.
+.env
+
+# Agent worktrees. Each one is a full checkout of this repository living inside it, so committing
+# one would add the whole tree to the tree it is a checkout of.
+.claude/worktrees/
 
 # Runtime state. data/streams.json holds every stream's MQTT and InfluxDB
 # credentials — this repository is public.
-data/
+#
+# The directory itself is tracked, through .gitkeep, and the pair below is what makes that possible:
+# a bare `data/` would ignore the .gitkeep too, git does not carry empty directories, and a fresh
+# clone would have no data/ at all.
+data/*
+!data/.gitkeep
