@@ -65,9 +65,23 @@ def flatten_payload(topic: str, payload):
             yield clean_topic, num
 
 
-def make_line(measurement: str, value: float, timestamp_ns: int) -> str:
-    safe = measurement.replace(",", "\\,").replace(" ", "\\ ")
-    return f"{safe} value={value} {timestamp_ns}"
+def make_line(measurement: str, value: float, timestamp_ms: int) -> str:
+    # The backslash is replaced FIRST: doing it after the others would go back over the backslashes
+    # they just inserted and escape those too, turning `a,b` into `a\\,b` — an escaped backslash
+    # followed by a bare comma, which is the field separator again.
+    # The newline is the one that matters for safety: write_batch joins the batch with "\n", and a
+    # measurement name carrying a raw newline therefore injects whole extra line-protocol records
+    # into the request body — writes into any measurement the sender likes. Names are built from
+    # MQTT topics and from JSON keys inside the payload (flatten_payload), so the content is
+    # attacker-supplied by construction.
+    safe = (
+        measurement.replace("\\", "\\\\")
+        .replace(",", "\\,")
+        .replace(" ", "\\ ")
+        .replace("\n", "\\n")
+        .replace("\r", "\\r")
+    )
+    return f"{safe} value={value} {timestamp_ms}"
 
 
 class InfluxWriter:
