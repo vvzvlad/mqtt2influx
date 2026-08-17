@@ -1,0 +1,103 @@
+# Deploy template, kept in step with the Portainer stack that actually runs this service
+# (a standalone compose stack named `mqtt2influx`). Pull the prebuilt image from the Gitea
+# registry — do NOT build on prod.
+#
+# NAMING: the repository, this directory, the service, the container, the Portainer stack and the
+# image all use the same name, mqtt2influx. That is not cosmetic here — see the volume note below.
+#
+# WHAT THIS SERVICE IS: a bridge that subscribes to MQTT, flattens whatever arrives into InfluxDB
+# line protocol and writes it in batches, plus a small web UI to configure and watch the streams.
+# It has moved 612 million messages and written 604 million points on this host. MQTT does not
+# buffer for a subscriber that is not connected, so every second the container is down is points
+# that are gone for good rather than points that arrive late. Redeploy accordingly.
+
+# The stack joins an EXISTING network rather than creating its own. `external: true` means compose
+# will not create it and will fail loudly if it is missing, which is the right failure: silently
+# creating an empty network of the same name would detach this container from everything else on
+# the host that expects to reach it there.
+networks:
+  docker_main_net:
+    external: true
+
+# THE VOLUME NAME IS LOAD-BEARING AND THE ARITHMETIC BELOW IS THE WHOLE REASON THIS COMMENT EXISTS.
+#
+# All of this service's configuration — every stream, with its MQTT and InfluxDB hosts, credentials,
+# topic filters and prefixes — lives in ONE file, /data/streams.json, on this volume. There is no
+# database and no environment-variable fallback: an empty volume is a bridge that writes nothing and
+# a UI that shows an empty list.
+#
+# The key here is `data`, NOT `mqtt2influx_data`. Compose prefixes a non-external volume key with the
+# project name, and Portainer uses the STACK name as the project name: `mqtt2influx` + `_` + `data`
+# = `mqtt2influx_data`, which is exactly the volume that exists on the production host today
+# (verified: its labels read com.docker.compose.project=mqtt2influx, com.docker.compose.volume=data,
+# and the running container has it mounted at /data). Writing `mqtt2influx_data` as the key would ask
+# for `mqtt2influx_mqtt2influx_data` — a brand-new, EMPTY volume — and the redeploy would come up
+# looking healthy with every stream gone.
+#
+# The corollary: renaming the Portainer stack detaches the data just as effectively. If that is ever
+# needed, pin the volume first — `external: true` plus `name: mqtt2influx_data`.
+volumes:
+  data:
+
+services:
+  mqtt2influx:
+    image: gitea.vvzvlad.xyz/projects/mqtt2influx:latest
+    container_name: mqtt2influx
+    restart: unless-stopped
+    networks:
+      - docker_main_net
+    ports:
+      # Published straight onto the host's LAN address, deliberately: this stack does NOT go through
+      # Traefik and has no TLS router. The UI is reached as http://<host>:8111 from inside the
+      # network only. Changing the left-hand side breaks every bookmark; the right-hand side is the
+      # app's own port and follows PORT in main.py.
+      - "8111:8000"
+    environment:
+      # Read once at import time by src/mqtt_processor.py, so a change here needs a container
+      # restart, not just a reload. They bound the write batch: flush after BATCH_SIZE points or
+      # after BATCH_INTERVAL seconds, whichever comes first. 220/3 are the values this deployment
+      # has been running on — larger batches than the 100/1.0 defaults baked into the Dockerfile,
+      # which is what keeps the InfluxDB write rate reasonable at this message volume.
+      BATCH_SIZE: 220
+      BATCH_INTERVAL: 3
+    volumes:
+      - data:/data
+    logging:
+      # Without this a json-file log grows without bound until the host's disk is full — which on a
+      # service logging every flush is not a theoretical horizon. 5 x 10m caps it at 50 MB.
+      driver: "json-file"
+      options:
+        max-file: 5
+        max-size: 10m
+    labels:
+      # This host's image updater watches THIS label (not watchtower's). It is what makes a push of
+      # :latest by .gitea/workflows/image-check-publish.yml roll out on its own — and therefore what
+      # makes the smoke gate in that workflow the last place a broken image can still be stopped.
+      io.portainer.update.enable: "true"
+    healthcheck:
+      # There is NO curl in the image (python:3.11-slim ships without it, and nothing installs it),
+      # so the probe is the interpreter that is already there. /api/stats is the right target: it
+      # answers 200 with `[]` when no stream is running at all, which is the state right after a
+      # deploy onto a fresh volume — a probe against a stream-dependent endpoint would report
+      # unhealthy on a perfectly good container. `python -c` gets an explicit exit code rather than
+      # relying on urlopen raising, and a non-2xx status raises HTTPError, which exits non-zero.
+      test:
+        - CMD
+        - python
+        - -c
+        - |
+          import urllib.request, sys
+          with urllib.request.urlopen("http://127.0.0.1:8000/api/stats", timeout=3) as response:
+              sys.exit(0 if response.status == 200 else 1)
+      # THE TIMINGS ARE LOAD-BEARING. Do not raise them "because the service is stable".
+      # Docker schedules the FIRST probe one whole `interval` after `start_period` elapses, so a
+      # container with a long interval sits in `starting` and never once reports `healthy` inside
+      # the window an updater is watching. Portainer's image updater waits 120 s for `healthy` after
+      # recreating a container and ROLLS THE IMAGE BACK if it does not see it — so a long interval
+      # here does not merely delay a status, it makes every automatic update silently revert while
+      # the image itself looks fine. At 30s/10s this container reports healthy within ~15 s and the
+      # update sticks.
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s

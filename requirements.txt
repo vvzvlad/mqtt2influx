@@ -1,5 +1,29 @@
-fastapi
-uvicorn[standard]
-websockets
-aiomqtt
-aiohttp
+# Runtime dependencies of the service, pinned with `==`.
+#
+# They were unpinned until now, which meant the image built from this file was a different image
+# every week: `pip install fastapi` resolves to whatever is newest at build time, so a release that
+# broke aiomqtt's client API or starlette's static handling would arrive in production through a
+# rebuild that changed no line of this repository. For a bridge that has moved 612 million messages
+# without a gap that is the wrong trade — MQTT does not buffer, so every minute the container spends
+# crash-looping on a surprise upgrade is points lost for good.
+#
+# The versions are the ones the project actually runs on locally (.venv), and the whole set was
+# checked to resolve for CPython 3.11 — the interpreter in python:3.11-slim, which is both the image
+# base and the container the CI test suite runs in.
+#
+# Upgrading is a deliberate edit to this file: bump, let tests.yml build the image and run
+# ci/smoke.py against it, and merge only if the gate is green.
+
+fastapi==0.135.2
+uvicorn[standard]==0.42.0
+
+# `websockets` also arrives as part of uvicorn's [standard] extra, and it is still named here on
+# purpose: it is a DIRECT dependency of this service, not an incidental one. The web UI is driven
+# entirely over /ws — the initial snapshot plus a stats frame every two seconds — so an image
+# without a websocket implementation serves a dashboard that connects and then shows nothing.
+# Naming it here pins that implementation instead of inheriting whatever uvicorn's extra resolves
+# to, and ci/smoke.py imports it inside the built image and opens a real /ws connection.
+websockets==16.0
+
+aiomqtt==2.5.1
+aiohttp==3.13.5

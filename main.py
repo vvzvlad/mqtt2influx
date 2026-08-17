@@ -13,7 +13,10 @@ import os
 import uvicorn
 
 def main():
-    parser = argparse.ArgumentParser(description="Label Maker Server")
+    # The description said "Label Maker Server" until now — a leftover from the project this file
+    # was copied from, and the string `--help` printed to anyone asking what this service is.
+    parser = argparse.ArgumentParser(
+        description="mqtt2influx — MQTT to InfluxDB bridge with a web UI")
     parser.add_argument("--host", default="0.0.0.0", help="Host to bind the server to")
 
     default_port = int(os.getenv("PORT", "8000"))

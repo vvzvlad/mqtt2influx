@@ -1,0 +1,16 @@
+# Development and test dependencies. NOT installed into the runtime image — the Dockerfile installs
+# requirements.txt only, and .dockerignore keeps this file out of the build context entirely.
+#
+# Install with:  pip install -r requirements-dev.txt   (or `make install`)
+
+-r requirements.txt
+
+pytest==9.1.1
+
+# Required by `fastapi.testclient.TestClient`, which is what tests/test_api.py drives the whole REST
+# surface through. starlette's TestClient is a thin wrapper over an httpx client with an ASGI
+# transport, and it does `import httpx` at module import time — but plain `fastapi` does not depend
+# on httpx (only the `fastapi[standard]` extra does), so without this line the API tests do not fail
+# an assertion, they fail to import, and in CI that is a red suite whose message points at a missing
+# module rather than at anything about this project.
+httpx==0.28.1

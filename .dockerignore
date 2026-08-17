@@ -1,0 +1,47 @@
+# The whole build context is packed and sent to the docker daemon BEFORE the first instruction of
+# the Dockerfile runs, so everything named here is time and bandwidth saved on every single build.
+# Without this file that transfer includes .venv alone at ~65 MB — a host-built virtualenv holding
+# macOS/arm64 wheels for a Python 3.14 that does not exist in python:3.11-slim.
+#
+# It is also a second line of defence rather than the only one. The Dockerfile copies exactly three
+# paths (main.py, src/, static/) instead of `COPY . .`, so nothing below could reach the image today
+# anyway. That is precisely why this file has to exist: the day someone writes `COPY . .` — the
+# single most common edit a Dockerfile ever receives — this is what keeps the git history, the
+# developer's local .venv, the runtime data/ directory and the CI machinery out of a published
+# image. ci/smoke.py asserts the absence of .venv, .git, data/ and tests/ inside the built artefact,
+# so the guarantee is checked rather than assumed.
+
+# Version control and CI machinery: never needed at runtime, and .git in particular carries the
+# whole history of the repository into a public registry image.
+.git
+.gitignore
+.gitea
+.github
+ci/
+
+# Host-built virtualenvs. Wrong interpreter, wrong platform, ~65 MB.
+.venv/
+venv/
+
+# Bytecode compiled by a different interpreter than the one in the image.
+__pycache__/
+*.pyc
+.pytest_cache/
+
+# Runtime state. `data/` exists on a workstation and holds a developer's real streams.json —
+# including MQTT and InfluxDB passwords. It must never be baked into an image; in production /data
+# is a docker volume mounted at run time (see docker-compose.yml).
+data/
+
+# Tests and their fixtures are run in CI from the source tree, not from the image.
+tests/
+pytest.ini
+requirements-dev.txt
+
+# Documentation, editor and deploy files: read by humans and by the deploy host, not by the app.
+*.md
+Makefile
+docker-compose.yml
+*.code-workspace
+.roo/
+.DS_Store
