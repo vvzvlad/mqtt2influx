@@ -277,6 +277,80 @@ async def test_stop_all_stops_every_stream_and_empties_the_registry(processors):
     assert mgr._processors == {}
 
 
+async def test_stop_all_takes_every_stream_down_at_the_same_time(monkeypatch):
+    """Serialised, the first stream in the dictionary spends the whole grace period on its own.
+
+    Each `stop()` cancels a processor and waits for its final flush, and that flush can sit out
+    aiohttp's 10s timeout against an InfluxDB that has stopped answering — which is precisely the
+    situation in which the batches still in memory matter most. One after another, with docker's
+    stop grace period ticking, the streams behind the first one are killed with their batches
+    unwritten.
+
+    The doubles here block until all three have entered `stop()`, so a serialised `stop_all` cannot
+    finish at all: the first one waits for a signal only the third can send.
+    """
+    total = 3
+    entered = []
+    all_entered = asyncio.Event()
+
+    class _BlockingProcessor:
+        def __init__(self, cfg, on_event):
+            self.cfg = cfg
+
+        def start(self):
+            pass
+
+        async def stop(self):
+            entered.append(self.cfg.id)
+            if len(entered) == total:
+                all_entered.set()
+            await asyncio.wait_for(all_entered.wait(), timeout=2)
+
+    monkeypatch.setattr(stream_manager, "StreamProcessor", _BlockingProcessor)
+    mgr = StreamManager()
+    for stream_id in ("a", "b", "c"):
+        await mgr.start_stream(_cfg(stream_id))
+
+    await mgr.stop_all()
+
+    assert sorted(entered) == ["a", "b", "c"]
+    assert mgr._processors == {}
+
+
+async def test_one_stream_failing_on_the_way_down_does_not_keep_the_others_from_stopping(monkeypatch):
+    """`stop_all` runs from the lifespan's shutdown and is the last thing that happens.
+
+    A processor whose `stop()` raises — a writer session already closed, a task that died holding
+    something — must not abort the shutdown of the streams gathered alongside it: they would be
+    killed with their final flush never attempted. The registry has to end up empty either way,
+    because `stop_stream` removes the entry before it stops anything and nothing else ever will.
+    """
+    stopped = []
+
+    class _OneBadProcessor:
+        def __init__(self, cfg, on_event):
+            self.cfg = cfg
+
+        def start(self):
+            pass
+
+        async def stop(self):
+            await asyncio.sleep(0)
+            if self.cfg.id == "b":
+                raise RuntimeError("the writer's session was already closed")
+            stopped.append(self.cfg.id)
+
+    monkeypatch.setattr(stream_manager, "StreamProcessor", _OneBadProcessor)
+    mgr = StreamManager()
+    for stream_id in ("a", "b", "c"):
+        await mgr.start_stream(_cfg(stream_id))
+
+    await mgr.stop_all()  # must not raise
+
+    assert sorted(stopped) == ["a", "c"]
+    assert mgr._processors == {}
+
+
 # ── stats ─────────────────────────────────────────────────────────────────────────────────────────
 
 async def test_get_all_stats_reports_one_entry_per_running_stream(processors):
