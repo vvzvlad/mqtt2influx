@@ -48,8 +48,29 @@ def load_streams() -> List[StreamConfig]:
 
 def save_streams(streams: List[StreamConfig]):
     path = _config_path()
-    with open(path, "w") as f:
-        json.dump([asdict(s) for s in streams], f, indent=2)
+    # Written beside the target and renamed over it, never opened in place: `open(path, "w")`
+    # truncates before the first byte is serialized, so an exception mid-dump, a full disk or a
+    # killed container leaves a half-written streams.json — and this file is the ONLY copy of every
+    # stream's MQTT and InfluxDB credentials, with no database and no environment fallback behind
+    # it. load_streams() reports a damaged file as an empty one, so the next save would then write
+    # `[]` over it and make the loss permanent.
+    # The temporary file sits in the same directory because os.replace() is only atomic within a
+    # single filesystem; across one it degrades to copy-and-delete, which is the same truncation
+    # window again.
+    tmp = path + ".tmp"
+    try:
+        with open(tmp, "w") as f:
+            json.dump([asdict(s) for s in streams], f, indent=2)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, path)
+    except BaseException:
+        # Without this the partial temp file survives every failure and accumulates in DATA_DIR.
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
 
 
 def get_stream(stream_id: str) -> Optional[StreamConfig]:
