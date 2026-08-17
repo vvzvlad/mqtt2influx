@@ -62,13 +62,13 @@ jobs:
     # advertises it and serves every repository on the instance. Writing the runner's own name here
     # would leave the job queued forever, because no runner offers a label by that name.
     runs-on: ubuntu-latest
-    # The four step-level timeouts below come to 65 minutes (15 tests + 20 build + 15 smoke + 15
-    # push); 80 leaves 15 on top for checkout, the tag computation, the registry login, the two
+    # The four step-level timeouts below come to 70 minutes (15 tests + 20 build + 20 smoke + 15
+    # push); 85 leaves 15 on top for checkout, the tag computation, the registry login, the two
     # cleanup steps and the logout. The outer bound has to EXCEED the sum, not equal it: act_runner
     # kills the whole job when this fires, and a step marked `if: always()` is not guaranteed to run
     # afterwards — so a job that dies mid-push leaves the smoke containers and a few hundred MB of
     # image sitting on the daemon the entire fleet shares.
-    timeout-minutes: 80
+    timeout-minutes: 85
     # Job-level, so the test step, the smoke step and the cleanup step cannot disagree about it. They
     # are the ends of the same mechanism — ci/smoke.py names its container after this, the test step
     # names another, the cleanup step removes both by the same names — and written as separate
@@ -141,7 +141,12 @@ jobs:
           set -e
           tar -xf -
           pip install --no-cache-dir -r requirements-dev.txt
-          pytest --tb=short -q
+          # No -q on this line, and that is deliberate rather than an omission: pytest.ini already
+          # carries `addopts = -q`, so adding one here makes it -qq — and at -qq pytest stops
+          # printing its `N passed` summary altogether, leaving a column of dots. That line is the
+          # only count of what really ran that a human reads, and without it a suite that quietly
+          # collected half of itself produces a log indistinguishable from a healthy one.
+          pytest --tb=short
         '
     - name: Compute image tags
       id: tags
@@ -261,11 +266,13 @@ jobs:
       # python3. Inside the container it is the other way round — the image's own interpreter is
       # `python` — and ci/smoke.py invokes it accordingly.
       #
-      # 15 minutes, set against ci/smoke.py's own worst case of roughly 8 if every docker call it
-      # makes runs out its bound. In practice the whole gate is well under a minute. Being killed BY
-      # this timeout is what the margin is for: the script's own container cleanup would not run, and
-      # the `if: always()` step below catches that.
-      timeout-minutes: 15
+      # 20 minutes, set against ci/smoke.py's own worst case of roughly 15 if every docker call it
+      # makes runs out its bound. In practice the whole gate is well under a minute — the worst case
+      # grew when the gate gained the volume-repair restart and the SIGTERM shutdown, both of which
+      # wait on the container rather than on the daemon. Being killed BY this timeout is what the
+      # margin is for: the script's own container cleanup would not run, and the `if: always()` step
+      # below catches that.
+      timeout-minutes: 20
       env:
         SMOKE_IMAGE: ${{ steps.tags.outputs.smoke }}
       # The body of this step is byte-identical to the one in tests.yml. Only the `env:` value above

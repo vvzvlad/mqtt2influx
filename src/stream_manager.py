@@ -53,8 +53,21 @@ class StreamManager:
             await self.start_stream(cfg)
 
     async def stop_all(self):
-        for sid in list(self._processors):
-            await self.stop_stream(sid)
+        # Concurrently, not one after another. Every stop() cancels a processor and waits for its
+        # final flush, and that flush can sit out aiohttp's 10s timeout against an InfluxDB that
+        # has stopped answering. Serialised, the first stream in the dictionary spends the whole of
+        # docker's stop grace period on its own and every stream behind it is killed with its batch
+        # still in memory — which is the one moment those points had left to be written.
+        # return_exceptions, because a bare gather hands the first failure straight back to the
+        # caller and leaves the other stops running with nobody awaiting them: the lifespan would
+        # finish its shutdown while those final flushes were still in flight and the process would
+        # exit out from under them.
+        stream_ids = list(self._processors)
+        results = await asyncio.gather(
+            *(self.stop_stream(sid) for sid in stream_ids), return_exceptions=True)
+        for sid, result in zip(stream_ids, results):
+            if isinstance(result, BaseException):
+                logger.error("Stream %s did not stop cleanly: %s", sid, result)
 
     def get_all_stats(self) -> list:
         return [p.get_stats() for p in self._processors.values()]
@@ -64,7 +77,12 @@ class StreamManager:
         return proc.get_stats() if proc else {}
 
     def is_running(self, stream_id: str) -> bool:
-        return stream_id in self._processors
+        # Asks the processor's task, not the dictionary. A processor whose `_run` died — an
+        # exception before the message loop is entered, say — is never removed from `_processors`,
+        # so the key outlives the task and GET /api/streams reported `running: true` for a stream
+        # that had stopped writing points.
+        proc = self._processors.get(stream_id)
+        return proc.is_alive if proc else False
 
 
 manager = StreamManager()

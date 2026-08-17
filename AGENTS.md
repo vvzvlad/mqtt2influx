@@ -23,6 +23,11 @@ as thorough as it is, and it is the reason not to skip it.
 - `.gitea/workflows/` — CI (Gitea Actions); there is no `.github/workflows`
 - `data/` — runtime state on a workstation; in production `/data` is a docker volume
 - `main.py` — thin entry point: argparse + `uvicorn.run("src.api:app")`
+- `entrypoint.sh` — the image's ENTRYPOINT: starts as root, chowns `/data`, then `exec`s gosu to
+  drop to uid 1000. `exec` in both branches, so the python process is PID 1 and gets SIGTERM
+- `CLAUDE.md` — one line, `@AGENTS.md`. Claude Code reads only `CLAUDE.md` and does not read this
+  file at all, so that import is the only thing putting these instructions in an agent's context.
+  Keep it a native import — a copy would drift and a symlink is not what the loader follows
 
 ## Setup
 All routine actions go through the `Makefile` — run `make help` to list targets.
@@ -45,13 +50,22 @@ make run       # http://127.0.0.1:8000, DATA_DIR defaults to /data — override 
 - Repeated actions go through `make` targets (`install` / `test` / `run`).
 - Python always runs inside a local `.venv`, created automatically by `make`.
 - Commit files by name (`git add <path>`), never `git add -A`.
-- **`.gitignore` is not to be edited.** Standing instruction from the owner.
+- `.gitignore` is editable (the owner's earlier standing instruction not to touch it has been
+  lifted), but the `data/` entry is not free-form: it is the pair `data/*` + `!data/.gitkeep`.
+  A bare `data/` would ignore the `.gitkeep` too, and since git does not carry empty directories
+  the directory would simply not exist in a fresh clone. What must never change is that
+  `data/streams.json` stays ignored — it holds real broker credentials and this repository is
+  public.
 - Dependencies in `requirements.txt` are PINNED with `==`. Adding one means pinning it;
   upgrading one means editing this file deliberately and letting the gate judge the result.
 - Tests are required for new code. An invariant with no test that goes red when it is broken
   is an intention, not an invariant — so when fixing a bug, check the new test by breaking
   the mechanism again and confirming it fails.
 - No `EXPOSE` in the Dockerfile; ports are published in docker-compose.
+- No static `USER` in the Dockerfile either, and that is not an oversight to be tidied up:
+  `entrypoint.sh` needs root to chown `/data` and drops to uid 1000 itself with gosu. A `USER app`
+  line would take that root away and break every deployment whose volume was created by an older
+  root-based image.
 
 ## Things that are easy to get wrong here
 - **There are no required environment variables.** Everything the service is configured with
