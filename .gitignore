@@ -6,6 +6,7 @@ venv/
 ENV/
 env/
 .pytest_cache/
+.coverage
 .DS_Store
 logs/
 
