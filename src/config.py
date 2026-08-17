@@ -46,6 +46,25 @@ def load_streams() -> List[StreamConfig]:
         return []
 
 
+def _fsync_directory(directory: str):
+    # Failures are swallowed on purpose, and only here. By the time this runs os.replace() has
+    # already succeeded, so the new config IS the file on disk: turning "the directory entry could
+    # not be flushed" into an exception would answer a completed save with a 500 and invite the
+    # operator to save again. Filesystems and platforms that refuse to open or fsync a directory
+    # exist; a config that is saved but not yet guaranteed against a power cut is strictly better
+    # than a config the API claims it failed to save.
+    try:
+        fd = os.open(directory or ".", os.O_RDONLY)
+    except OSError:
+        return
+    try:
+        os.fsync(fd)
+    except OSError:
+        pass
+    finally:
+        os.close(fd)
+
+
 def save_streams(streams: List[StreamConfig]):
     path = _config_path()
     # Written beside the target and renamed over it, never opened in place: `open(path, "w")`
@@ -64,6 +83,13 @@ def save_streams(streams: List[StreamConfig]):
             f.flush()
             os.fsync(f.fileno())
         os.replace(tmp, path)
+        # fsync of the file made its CONTENTS durable; the rename is a change to the DIRECTORY and
+        # is not durable until the directory itself is synced. Lose power in the window between the
+        # two and the filesystem can come back with the old streams.json, or with neither name
+        # pointing at the new data — and this file has no backup and no second copy. Against a
+        # SIGKILL of the container it makes no difference (the page cache survives the process);
+        # against the host losing power it is the difference between a saved config and a lost one.
+        _fsync_directory(os.path.dirname(path))
     except BaseException:
         # Without this the partial temp file survives every failure and accumulates in DATA_DIR.
         try:
