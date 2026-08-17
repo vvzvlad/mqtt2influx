@@ -543,9 +543,9 @@ async def test_points_handed_back_by_a_cancelled_write_go_in_front_of_the_newer_
 
 async def test_a_shutdown_during_a_size_flush_still_accounts_for_every_published_point(monkeypatch):
     # Path one: the flush in flight belongs to the message loop, fired because the batch filled.
-    # The cancellation lands inside it, `_process_forever` catches it and runs the final flush —
-    # which, before this, looked at a `self._batch` the cancelled write had already emptied, found
-    # nothing, and returned. Every point published here has to end up either written or still in
+    # The cancellation lands inside it, unwinds the message loop, and `_connect_and_process`'s
+    # finally runs the final flush — which, before this, looked at a `self._batch` the cancelled
+    # write had already emptied, found nothing, and returned. Every point published here has to end up either written or still in
     # the batch; anything else is a point that existed and then did not.
     monkeypatch.setattr(mqtt_processor, "BATCH_INTERVAL", 60)
     monkeypatch.setattr(mqtt_processor, "BATCH_SIZE", 2)
@@ -593,6 +593,103 @@ async def test_a_shutdown_while_the_timer_is_writing_does_not_lose_the_timers_ba
 
     assert [(topic, value) for topic, value, _ts in writer.stored] == [("dev/a", 1.0)]
     assert proc._batch == []
+    assert live_flush_timers() == []
+
+
+async def test_a_cancellation_inside_the_retry_ladder_still_gives_the_points_back(monkeypatch):
+    # The third of the cancellation paths and the one none of the others reach: both tests above
+    # flush with `retry=False`, so `async with asyncio.timeout(RETRY_BUDGET)` in _write_with_retries
+    # is never entered at all. In production it is entered on every flush the message loop and the
+    # timer make — and it is the widest window of the three, because a stream that is retrying is a
+    # stream whose InfluxDB is already unwell, which is exactly when a deploy tends to be happening.
+    #
+    # It is also the window with a second way to lose the batch. The budget's expiry arrives at the
+    # same await, as a CancelledError raised by asyncio.timeout, and THAT one is meant to be caught
+    # and turned into a dropped batch (test_the_retry_ladder_is_capped_in_wall_clock_time requires
+    # it). Widening `except TimeoutError` to take the cancellation with it — the obvious tidy-up —
+    # would make a shutdown mid-ladder look like an exhausted budget: the points are gone, an error
+    # is counted, and the final flush finds an empty batch.
+    #
+    # RETRY_BUDGET is raised rather than left alone so that the two cannot be confused here: nothing
+    # in this test can reach the budget, so the only thing that can empty the batch is the
+    # cancellation.
+    monkeypatch.setattr(mqtt_processor, "RETRY_DELAYS", (0.0, 0.0, 0.0))
+    monkeypatch.setattr(mqtt_processor, "RETRY_BUDGET", 30.0)
+
+    class _HangsOnTheSecondAttempt:
+        def __init__(self):
+            self.calls = []
+            self.retrying = asyncio.Event()
+
+        async def write_batch_detailed(self, batch):
+            self.calls.append(list(batch))
+            if len(self.calls) == 1:
+                await asyncio.sleep(0)
+                return False, True  # retryable: this is what opens the ladder
+            self.retrying.set()
+            await asyncio.sleep(3600)  # an InfluxDB that accepted the connection and went quiet
+            raise AssertionError("unreachable: the test cancels long before this")
+
+        async def write_batch(self, batch):
+            raise AssertionError("the ladder must go through write_batch_detailed")
+
+    proc = make_processor()
+    writer = _HangsOnTheSecondAttempt()
+    points = [("dev/temp", 21.5, 1000), ("dev/hum", 40.0, 1001)]
+    proc._batch = list(points)
+
+    flush = asyncio.create_task(proc._flush(writer, retry=True))
+    await asyncio.wait_for(writer.retrying.wait(), timeout=5)
+    flush.cancel()
+    with suppress(asyncio.CancelledError):
+        await flush
+
+    assert len(writer.calls) == 2, "the ladder was never entered, so this tested nothing"
+    assert proc._batch == points
+    assert proc.batch_current == 2
+    # Not an error and not a drop: this batch is still going to be written by the final flush. An
+    # errors of 1 here is the budget path having been taken by mistake.
+    assert proc.errors == 0
+    assert proc.points_sent == 0
+
+
+# --- leaving the message loop is what flushes, whichever way it was left ---------------------------
+
+async def test_a_stream_that_leaves_the_message_loop_on_its_own_still_flushes_what_it_batched(monkeypatch):
+    """`if not self._running: break` is a normal return, not a cancellation.
+
+    It leaves the `async for`, `while self._running` is then false, and `_process_forever` returns —
+    so while the final flush lived in a handler for `asyncio.CancelledError` this path walked past
+    it with up to BATCH_SIZE points still in `self._batch`, and the timer's `finally` then handed
+    the timer's own rescued points into the same batch with nothing left running to send them.
+
+    Nothing reaches it through `stop()` today: it sets `_running` and cancels in the same run of
+    statements with no await between them, so the task never observes the gap. The `break` is
+    written for a soft stop all the same — a paused stream, a drain before a reload — and this test
+    is what keeps that from being a silent loss of one batch per stream the day one is added.
+    """
+    monkeypatch.setattr(mqtt_processor, "BATCH_INTERVAL", 60)   # no interval flush
+    monkeypatch.setattr(mqtt_processor, "BATCH_SIZE", 1000)     # no size flush
+    queue = asyncio.Queue()
+    install_fake_client(monkeypatch, queue)
+
+    proc = make_processor()
+    writer = FakeWriter()
+    proc._running = True
+    task = asyncio.create_task(proc._connect_and_process(writer))
+    queue.put_nowait(FakeMessage("dev/a", "1"))
+    assert await eventually(lambda: proc.batch_current == 1), "the point never reached the batch"
+
+    # No cancel() anywhere in this test — that is the whole point. The flag is cleared and a second
+    # message is what wakes the loop to notice it.
+    proc._running = False
+    queue.put_nowait(FakeMessage("dev/b", "2"))
+
+    await asyncio.wait_for(task, timeout=5)
+
+    assert [(topic, value) for topic, value, _ts in writer.stored] == [("dev/a", 1.0)]
+    assert proc._batch == []
+    assert proc.batch_current == 0
     assert live_flush_timers() == []
 
 

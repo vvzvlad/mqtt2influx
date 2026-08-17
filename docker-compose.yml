@@ -52,16 +52,28 @@ services:
     # recreated — which, with `io.portainer.update.enable` below, is something an updater does on
     # its own every time :latest moves. The DEFAULT IS 10 s and it is not enough here.
     #
-    # The arithmetic: SIGTERM reaches the python process (that is what the gosu construction in the
-    # Dockerfile is for), uvicorn shuts the app down through its lifespan, and that calls
-    # manager.stop_all() — which stops the streams ONE AT A TIME, each ending in a final flush whose
-    # HTTP write is bounded by ClientTimeout(total=10) in src/influx_writer.py. So an InfluxDB that
-    # is unreachable at that moment costs 10 s PER STREAM. At the default the very first stream
-    # spends the entire window, SIGKILL arrives, and every other stream's batch is dropped without
-    # ever having been attempted — the one loss that is silent, because the process is gone before
-    # it could log anything. 30 s covers three such streams; raise it if this deployment grows more.
-    # It costs nothing on a healthy stop: the process exits as soon as it is done and docker does
-    # not wait out the remainder.
+    # The arithmetic, and note that it is PER DEPLOYMENT rather than per stream: SIGTERM reaches the
+    # python process (that is what the gosu construction in the Dockerfile is for), uvicorn shuts the
+    # app down through its lifespan, and that calls manager.stop_all() — which stops every stream AT
+    # ONCE, through asyncio.gather. So what has to fit in this window is the slowest single stream,
+    # not the sum of them.
+    #
+    # One stream's worst case is two ten-second waits, in this order and against an InfluxDB and a
+    # broker that have both stopped answering:
+    #   1. the cancellation unwinds `async with aiomqtt.Client(...)`, whose __aexit__ waits for the
+    #      disconnect acknowledgement — bounded by the `timeout=10` that client is constructed with
+    #      in src/mqtt_processor.py. This is spent BEFORE the final flush has begun.
+    #   2. the final flush itself: ONE HTTP write, no retry ladder, bounded by ClientTimeout(total=10)
+    #      in src/influx_writer.py.
+    # Twenty seconds, plus uvicorn's own shutdown, and 30 s is that with margin. At the default of
+    # 10 s the SIGKILL would land while step 1 was still running and every stream's batch would be
+    # dropped without a write ever having been attempted — the one loss that is silent, because the
+    # process is gone before it could log anything.
+    #
+    # So do NOT scale this with the number of streams: they wait out their timeouts in parallel, and
+    # a grace period sized as "10 s per stream" only lengthens every deploy that meets a hung
+    # InfluxDB. It costs nothing on a healthy stop either — the process exits as soon as it is done
+    # and docker does not wait out the remainder.
     stop_grace_period: 30s
     # The container STARTS as root — /entrypoint.sh needs it to chown this volume, which production
     # wrote back when the image still ran as root — and immediately drops to uid 1000 with gosu.

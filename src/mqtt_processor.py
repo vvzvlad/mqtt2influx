@@ -281,17 +281,34 @@ class StreamProcessor:
         # batch for the lifetime of the stream.
         timer = asyncio.create_task(self._flush_timer(writer), name=f"flush-timer-{self.cfg.id}")
         try:
-            await self._process_forever(writer, timer)
+            await self._process_forever(writer)
         finally:
+            # THE FINAL FLUSH LIVES HERE, in a finally, and not in a handler for the cancellation
+            # that usually causes it. The message loop has more than one way out and only one of
+            # them is a cancellation: `if not self._running: break` returns NORMALLY, as does an
+            # __aexit__ that turns a cancellation into an MqttError on its way out — its disconnect
+            # wait is bounded by the same `timeout=10` the client is built with, and a timeout there
+            # raises MqttError, which the loop's `except Exception` then absorbs. Both paths used to
+            # walk past the flush with up to BATCH_SIZE points still in self._batch, including the
+            # ones the timer's own cancellation handler had just rescued into it, and nothing left
+            # running to send them. Put here, the flush is what EXITING the message loop means,
+            # whichever way it exited.
+            #
+            # Order matters and is unchanged: the timer is cancelled first, because a tick landing
+            # between here and the flush would race it for the same batch; then it is AWAITED, not
+            # merely cancelled, because cancel() only schedules the cancellation and the timer may
+            # be sitting in the middle of its own write with the whole batch held in a local. It
+            # hands those points back to self._batch when the cancellation actually reaches it,
+            # which is a later pass of the event loop than this one. Awaiting it is also what keeps
+            # _run()'s finally from closing the writer's HTTP session under a timer still mid-flush.
+            # Finally the flush itself runs WITHOUT the retry ladder, so a shutdown never waits out
+            # its sleeps against a dead InfluxDB.
             timer.cancel()
-            # Awaited, not just cancelled: _run()'s finally closes the writer's HTTP session the
-            # moment this returns, and a timer still mid-flush would then write into a closed one.
-            try:
+            with suppress(asyncio.CancelledError):
                 await timer
-            except asyncio.CancelledError:
-                pass
+            await self._flush(writer, retry=False)
 
-    async def _process_forever(self, writer: InfluxWriter, timer: asyncio.Task):
+    async def _process_forever(self, writer: InfluxWriter):
         while self._running:
             try:
                 client_kwargs = dict(
@@ -310,6 +327,11 @@ class StreamProcessor:
                     logger.info("[%s] MQTT connected, subscribed to %s", self.cfg.id, self.cfg.mqtt_topic)
 
                     async for message in client.messages:
+                        # Leaves the loop without an exception, so nothing but _connect_and_process's
+                        # finally sends what is already batched. Unreachable through stop() today —
+                        # it sets _running and cancels in the same run of statements, so the task
+                        # never observes the gap — but any future soft stop (a paused stream, a
+                        # drain before a reload) arrives exactly here.
                         if not self._running:
                             break
 
@@ -365,22 +387,6 @@ class StreamProcessor:
                         if batch_full:
                             await self._flush(writer)
 
-            except asyncio.CancelledError:
-                # Order matters. The timer goes first, because a tick landing between here and the
-                # final flush would race it for the same batch; then the last flush runs WITHOUT the
-                # retry ladder, so a shutdown never waits out its sleeps against a dead InfluxDB.
-                timer.cancel()
-                # And the timer is AWAITED before that flush, not merely cancelled. cancel() only
-                # schedules the cancellation, and the timer may be sitting in the middle of its own
-                # write with the whole batch held in a local — at BATCH_INTERVAL=3 against a slow
-                # InfluxDB that is where it spends most of its life. It hands those points back to
-                # self._batch when the cancellation actually reaches it, which is a later pass of
-                # the event loop than this one; flushing first would write an empty batch, return,
-                # and leave the timer's points in memory with nothing left running to send them.
-                with suppress(asyncio.CancelledError):
-                    await timer
-                await self._flush(writer, retry=False)
-                raise
             except Exception as e:
                 self.errors += 1
                 logger.error("[%s] Error: %s", self.cfg.id, e)

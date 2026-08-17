@@ -604,14 +604,20 @@ def check_crud_cycle():
     # --- persistence: read the volume, do not take the API's word for it --------------------------
     if os.path.isfile(CONFIG_PATH):
         record(targets[2], None)
+        # A sentinel rather than None for "the file could not be read". `json.load` returns None for
+        # a file holding the literal `null` — which is exactly what a store that wrote the wrong
+        # thing produces — and with None meaning both, that case recorded NO verdict for targets[3]
+        # at all: the probe would print 23 rows instead of 24 and the gate's exact-count check would
+        # report "a check stopped emitting rows" for what is really "the volume holds null".
+        unread = object()
+        on_disk = unread
         try:
             with open(CONFIG_PATH) as handle:
                 on_disk = json.load(handle)
         except Exception as error:
-            on_disk = None
             record(targets[3], "it is there but could not be read as JSON: {}".format(
                 describe(error)))
-        if on_disk is not None:
+        if on_disk is not unread:
             if (isinstance(on_disk, list) and len(on_disk) == 1
                     and on_disk[0].get("id") == stream_id
                     and on_disk[0].get("name") == STREAM_BODY["name"]
@@ -1126,6 +1132,13 @@ def check_startup_markers(name, started):
     if status is None:
         reason = "not attempted: `docker logs` produced no exit code — {}".format(logs)
         return [("the log carries {!r}".format(marker), reason) for marker in STARTUP_MARKERS], ""
+    if status != 0:
+        # Same distinction the repair check makes: on a non-zero exit `logs` is docker's complaint,
+        # not the container's output, and searching it for uvicorn's lines would report a boot that
+        # never printed them — pointing at the image rather than at the daemon that refused to say.
+        # The transcript is returned empty for the same reason: it is not a log.
+        reason = "not attempted: `docker logs` exited {}:\n{}".format(status, excerpt(logs))
+        return [("the log carries {!r}".format(marker), reason) for marker in STARTUP_MARKERS], ""
 
     rows = []
     for marker in STARTUP_MARKERS:
@@ -1302,6 +1315,15 @@ def check_volume_repair(name, started):
     log_status, logs = wait_for_markers(name, STARTUP_MARKERS, BOOT_BUDGET, minimum=2)
     if log_status is None:
         rows.append((restart_target, "`docker logs` produced no exit code — {}".format(logs)))
+        return rows, False
+    if log_status != 0:
+        # Its own reason, because `logs` here holds docker's error text and not the container's
+        # output: counting markers in it would find none and the row below would blame the
+        # entrypoint for a restart loop, sending the reader into entrypoint.sh over a daemon that
+        # simply would not answer. "The check could not run" and "the check failed" are different
+        # sentences everywhere else in this file — see check_container_alive and check_final_log.
+        rows.append((restart_target, "`docker logs` exited {}:\n{}".format(
+            log_status, excerpt(logs))))
         return rows, False
     missing = [marker for marker in STARTUP_MARKERS if logs.count(marker) < 2]
     if missing:
