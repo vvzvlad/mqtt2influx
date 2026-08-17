@@ -44,8 +44,15 @@ Everything internal therefore goes through `docker exec`, which puts the probe i
 own namespace — where 127.0.0.1 means what the compose healthcheck means by it.
 
 Two more properties of `docker exec` are worth stating because checks below depend on them: it does
-NOT go through ENTRYPOINT (which is why the contract check insists there is none, rather than
-assuming it), and it runs as the image's `Config.User`.
+NOT go through ENTRYPOINT, and it runs as the image's `Config.User`. Both cut the same way here. The
+image declares `/entrypoint.sh` — which starts as root, repairs the ownership of /data and `exec`s
+gosu to drop to uid 1000 — and declares no `USER`, so every probe below arrives as ROOT and bypasses
+that drop entirely. Half of that is convenient: a root probe can read /proc/1/status and stat /data
+whatever their ownership. The other half is a trap, and it is the one that matters — a probe that
+asked for its OWN uid would answer 0 forever and prove nothing about the process that serves. So the
+non-root check interrogates PID 1, the only process in the container that came through the
+entrypoint, and the contract check pins the ENTRYPOINT to an exact value rather than reading it off
+a process that never went through one.
 
 WHY THE CRUD CYCLE IS THE CENTRE OF THIS FILE
 ---------------------------------------------
@@ -66,7 +73,7 @@ image's fault.
 
 THE CHECKS
 ----------
-* (a) the image's declared contract: CMD, WORKDIR, no ENTRYPOINT, DATA_DIR=/data. Outer half.
+* (a) the image's declared contract: CMD, WORKDIR, ENTRYPOINT, DATA_DIR=/data. Outer half.
 * (b) the real command starts and uvicorn reports itself listening on 8000. Outer half.
 * (c) the empty state: GET /api/streams answers 200 with [] on a fresh volume. Service probe.
 * (d) the full CRUD cycle over HTTP, including the second DELETE that must be a 404. Service probe.
@@ -83,6 +90,13 @@ THE CHECKS
 * (j) the runtime dependencies import: fastapi, uvicorn, aiomqtt, aiohttp, websockets. Image probe.
 * (k) the container is still running at the end, and the log it has BY THEN carries no traceback.
       Outer half.
+* (l) PID 1 — the process the ENTRYPOINT actually started — runs as uid 1000 and not as root. This
+      is the artefact, not the intention: a Dockerfile can carry every non-root instruction there is
+      and still serve as root if the entrypoint stopped `exec`ing gosu. Service probe.
+* (m) /data is writable by the uid PID 1 really runs as. The privilege drop and the volume's
+      ownership are set in two different places — a chown at build time and a chown at start — and
+      an image that dropped privileges but left the volume owned by root comes up perfectly, serves
+      every read, and fails the first time somebody saves a stream. Service probe.
 
 Two properties matter and are easy to lose, so they are stated where they can be checked:
 
@@ -123,6 +137,11 @@ ALL_SUFFIXES = (SERVE_SUFFIX,)
 # ── what the image is supposed to declare ─────────────────────────────────────────────────────────
 APP_DIR = "/app"
 EXPECTED_CMD = ["python", "main.py"]
+# Pinned to an exact value, not merely "there is one". This is the ONLY evidence this gate has that
+# the privilege-dropping wrapper is still on the image: every in-container check below enters through
+# `docker exec`, which walks straight past the entrypoint, so an image that lost it would answer all
+# of them exactly as it does now while quietly going back to serving as root.
+EXPECTED_ENTRYPOINT = ["/entrypoint.sh"]
 # `DATA_DIR=/data` is not decoration: src/config.py reads it once at import and every stream this
 # service knows about lives in one file under it. An image that lost this variable would default to
 # the same "/data" today — and would silently start writing into the container's writable layer the
@@ -146,8 +165,10 @@ SERVICE_PROBE_MARKER = "mqtt2influx service probe ok"
 # The number of verdicts each probe is supposed to print. Compared EXACTLY rather than "at least",
 # because the failure this catches is a probe that quietly stopped checking things: every line it
 # does print says ok and it exits 0, so nothing else in this file would notice.
+# 15 = 5 files that must be in the image + 5 that must not + 5 runtime imports.
 EXPECTED_IMAGE_PROBE_TARGETS = 15
-EXPECTED_SERVICE_PROBE_TARGETS = 22
+# 24 = 2 process identity + 2 empty state + 12 CRUD + 2 stats + 4 static UI + 2 websocket.
+EXPECTED_SERVICE_PROBE_TARGETS = 24
 
 IMAGE_PROBE_ROW_PREFIX = "[in-image] "
 SERVICE_PROBE_ROW_PREFIX = "[in-container] "
@@ -299,6 +320,7 @@ if __name__ == "__main__":
 SERVICE_PROBE = r'''
 import json
 import os
+import stat
 import urllib.error
 import urllib.request
 
@@ -311,6 +333,14 @@ HTTP_TIMEOUT = 15
 
 # Written by src/config.py under DATA_DIR, which the image sets to /data.
 CONFIG_PATH = "/data/streams.json"
+STATE_DIR = "/data"
+
+# The uid the Dockerfile creates and /entrypoint.sh drops to with gosu. Checked against PID 1 and
+# NOT against this probe's own uid: `docker exec` does not go through ENTRYPOINT and runs as the
+# image's Config.User, which the Dockerfile deliberately leaves unset — so os.getuid() here is 0 on
+# a perfectly good image and would be 0 just the same on one that never drops privileges at all.
+# PID 1 is the only process in this container that came through the entrypoint.
+APP_UID = 1000
 
 # A real line out of static/index.html rather than a generic "<html". A directory served with the
 # wrong contents, or an index.html replaced by a placeholder, would sail through a check for "<html".
@@ -369,6 +399,86 @@ def call(method, path, payload=None):
             return response.status, response.headers, response.read().decode("utf-8", "replace")
     except urllib.error.HTTPError as error:
         return error.code, error.headers, error.read().decode("utf-8", "replace")
+
+
+def pid1_ids():
+    """The REAL uid and gid of PID 1, read out of procfs.
+
+    The `Uid:`/`Gid:` lines in /proc/<pid>/status are tab-separated as real, effective, saved, fs.
+    The FIRST column is the one taken: an effective uid of 1000 sitting on a real uid of 0 is a
+    process that can climb straight back, and reading the second column would call that a pass.
+
+    procfs and not `ps`: python:3.11-slim ships no procps, so a `ps` here would fail on the image
+    being tested rather than on anything it is testing.
+    """
+    uid = None
+    gid = None
+    with open("/proc/1/status") as handle:
+        for line in handle:
+            if line.startswith("Uid:"):
+                uid = int(line.split()[1])
+            elif line.startswith("Gid:"):
+                gid = int(line.split()[1])
+    return uid, gid
+
+
+def check_process_identity():
+    """(l) + (m) Who is serving, and whether the state directory is writable BY THEM.
+
+    Both rows interrogate the running process rather than the image's declarations, and that is the
+    entire point: a Dockerfile can carry every non-root instruction there is while the entrypoint
+    has quietly stopped `exec`ing gosu, and no other check in this gate would see the difference —
+    they all arrive through `docker exec`, which never goes through the entrypoint at all.
+
+    Runs BEFORE the CRUD cycle so that an unwritable /data is diagnosed as an unwritable /data. The
+    CRUD cycle would otherwise report the same fault only as a missing streams.json, which reads
+    like a store bug and sends whoever is looking into src/config.py.
+    """
+    uid_target = "PID 1 serves as uid {} rather than as root".format(APP_UID)
+    write_target = "{} is writable by the uid PID 1 actually runs as".format(STATE_DIR)
+    try:
+        uid, gid = pid1_ids()
+    except Exception as error:
+        reason = "/proc/1/status could not be read: {}".format(describe(error))
+        record(uid_target, reason)
+        record(write_target, "not attempted: " + reason)
+        return
+    if uid is None or gid is None:
+        reason = (
+            "/proc/1/status carried no Uid:/Gid: line, so the serving process cannot be identified "
+            "and neither of these two claims can be made about it")
+        record(uid_target, reason)
+        record(write_target, "not attempted: " + reason)
+        return
+
+    record(uid_target, None if uid == APP_UID else (
+        "it runs as uid {}. {}".format(uid, (
+            "That is root: the privilege drop did not happen. Either /entrypoint.sh stopped "
+            "`exec`ing gosu, or the ENTRYPOINT is off the image and CMD ran on its own"
+        ) if uid == 0 else (
+            "That is neither root nor the `app` account the image creates, so the ownership the "
+            "Dockerfile and the entrypoint put on {} belongs to somebody else".format(STATE_DIR)))))
+
+    try:
+        info = os.stat(STATE_DIR)
+    except Exception as error:
+        record(write_target, "{} could not be stat'ed: {}".format(STATE_DIR, describe(error)))
+        return
+    # Worked out against PID 1's ids by hand rather than with os.access(), which answers for the
+    # CALLER — and the caller here is root, for whom every directory is writable and this check
+    # would be a permanent pass. What it exists to catch is the production case the entrypoint's
+    # chown was written for: a volume created by the old root-based image, whose ownership the
+    # Dockerfile's build-time chown never touched because docker only seeds an EMPTY volume.
+    mode = info.st_mode
+    writable = (
+        (info.st_uid == uid and mode & stat.S_IWUSR)
+        or (info.st_gid == gid and mode & stat.S_IWGRP)
+        or mode & stat.S_IWOTH)
+    record(write_target, None if writable else (
+        "it is owned by {}:{} with mode {}, and PID 1 is {}:{}. A container like this comes up, "
+        "reports healthy and answers every read — it fails the first time somebody saves a stream, "
+        "which is the one moment nobody is watching the log".format(
+            info.st_uid, info.st_gid, oct(stat.S_IMODE(mode)), uid, gid)))
 
 
 def check_empty_state():
@@ -661,6 +771,10 @@ def check_websocket():
 
 
 def main():
+    # First, and deliberately: it is the cheapest check here and it is the one that explains the
+    # others. A /data the serving uid cannot write turns the persistence rows below into a
+    # confusing report about a store that answers 200 and saves nothing.
+    check_process_identity()
     check_empty_state()
     check_crud_cycle()
     check_stats()
@@ -777,16 +891,18 @@ def wait_for_markers(name, markers, budget):
 
 
 def check_image_contract(image):
-    """(a) What the image DECLARES: its command, where it runs, that nothing wraps it, and DATA_DIR.
+    """(a) What the image DECLARES: its command, where it runs, what wraps it, and DATA_DIR.
 
-    Four claims, four rows. `docker exec` does not go through an ENTRYPOINT, so the "there is none"
-    row is what keeps the rest of this gate honest rather than a style preference: an image that
-    grew one would still answer every `exec` below while its real startup path went untested.
+    Four claims, four rows. The ENTRYPOINT row carries the weight here: `docker exec` does not go
+    through an entrypoint, so every in-container check in this gate enters PAST the privilege drop
+    and `docker inspect` is the only witness that the wrapper is still on the image. An image that
+    lost it would answer all of them exactly as it does now, while its real startup path went back
+    to running the CMD as root.
     """
     targets = [
         "the image declares CMD {}".format(EXPECTED_CMD),
         "the image declares WORKDIR {}".format(APP_DIR),
-        "the image declares no ENTRYPOINT",
+        "the image declares ENTRYPOINT {}".format(EXPECTED_ENTRYPOINT),
         "the image declares {} in its environment".format(EXPECTED_DATA_DIR),
     ]
     status, output = docker(["inspect", "--format", "{{json .Config}}", image], INSPECT_TIMEOUT)
@@ -820,10 +936,11 @@ def check_image_contract(image):
         "path — from the wrong directory the process dies on ModuleNotFoundError".format(workdir))))
 
     entrypoint = config.get("Entrypoint")
-    rows.append((targets[2], None if not entrypoint else (
-        "it declares {!r}. `docker exec` bypasses ENTRYPOINT, so every in-container check in this "
-        "gate would keep passing while the image's real startup path went unchecked".format(
-            entrypoint))))
+    rows.append((targets[2], None if entrypoint == EXPECTED_ENTRYPOINT else (
+        "it declares {!r}. /entrypoint.sh is what starts as root, chowns /data so a volume written "
+        "by the older root-based image stays usable, and `exec`s gosu to drop to uid 1000. "
+        "`docker exec` bypasses ENTRYPOINT, so every in-container check in this gate would keep "
+        "passing while the container went back to serving as root".format(entrypoint))))
 
     env = config.get("Env") or []
     rows.append((targets[3], None if EXPECTED_DATA_DIR in env else (
@@ -953,8 +1070,8 @@ def check_container_alive(name, started):
         return [(target, None)]
     return [(target, (
         "it is not running any more (`Running ExitCode` = {!r}). It answered the probes and then "
-        "stopped — in production, with `restart: unless-stopped`, that is a container that comes "
-        "back, drops its subscription, and loses whatever was published in between".format(state)))]
+        "stopped — in production, with `restart: always`, that is a container that comes back, "
+        "drops its subscription, and loses whatever was published in between".format(state)))]
 
 
 def check_final_log(name, started):
