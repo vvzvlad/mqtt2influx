@@ -7,6 +7,7 @@ import json
 import logging
 import os
 import time
+from contextlib import suppress
 from typing import Callable, Optional
 
 import aiomqtt
@@ -16,23 +17,56 @@ from .config import StreamConfig
 
 logger = logging.getLogger(__name__)
 
-BATCH_SIZE = int(os.environ.get("BATCH_SIZE", "100"))
-BATCH_INTERVAL = float(os.environ.get("BATCH_INTERVAL", "1.0"))
 
-# Backoff ladder for a failed InfluxDB write. write_batch() returns False for any non-2xx answer and
-# for any exception — an InfluxDB restart, a blipped network, a DNS hiccup — and before this the
-# batch was dropped on the first such answer, up to 220 points at the production BATCH_SIZE.
+def batch_size_from_env() -> int:
+    return int(os.environ.get("BATCH_SIZE", "100"))
+
+
+def batch_interval_from_env() -> float:
+    return float(os.environ.get("BATCH_INTERVAL", "1.0"))
+
+
+# Read once, at import. Through a function rather than inline so that "this value comes from the
+# environment" is something a test can state without reloading the module: production runs 220/3.0
+# out of docker-compose, and a build that quietly stopped reading BATCH_SIZE would fall back to 100
+# and multiply the number of write requests InfluxDB receives by 2.2 with nothing to show for it.
+BATCH_SIZE = batch_size_from_env()
+BATCH_INTERVAL = batch_interval_from_env()
+
+# Backoff ladder for an InfluxDB write that failed in a way worth repeating — a restart, a blipped
+# network, a DNS hiccup, a 5xx, a 429. Before this the batch was dropped on the first such answer,
+# up to 220 points at the production BATCH_SIZE. A 4xx that is not 429 never reaches the ladder;
+# write_batch_detailed() reports it as not worth retrying and the flush fails immediately.
 RETRY_DELAYS = (0.5, 1.0, 2.0)
 
-# Hard ceiling on the whole retry phase, and the reason there is one at all: a flush triggered from
-# the message loop runs INSIDE `async for message in client.messages`, so for as long as it retries
-# nothing is read from the broker, and MQTT does not buffer for a subscriber that is not reading.
-# Unbounded, the worst case would be the ladder's own 3.5s of sleeps plus four aiohttp timeouts of
-# 10s each — roughly 43s of unread MQTT to save 220 points, a cure far worse than the disease. With
-# the ceiling the added blind window is at most RETRY_BUDGET on top of the first attempt's existing
-# 10s timeout. It exceeds the sleeps (3.5s) so that a fast-failing InfluxDB still gets all three
-# retries; a slow-failing one gets however many fit.
+# Hard ceiling on the whole retry phase. A flush triggered from the message loop runs INSIDE
+# `async for message in client.messages`, so for as long as it retries this coroutine takes nothing
+# out of aiomqtt's incoming queue.
+#
+# What that costs is NOT an immediate loss, and the tuning only makes sense once that is clear:
+# aiomqtt's reader callback lives on the event loop, not on this coroutine, so while the consumer
+# hangs on an await the socket keeps being read and `_on_message` keeps putting messages into the
+# client's queue. A blocked consumer therefore buys backlog, not silence. With the queue bounded
+# (MAX_QUEUED_INCOMING_MESSAGES below) the backlog stops at that many messages and aiomqtt discards
+# further arrivals with a warning; unbounded, it grows in RAM for as long as the stall lasts, and
+# the container has no memory limit — the OOM kill that ends it takes the MQTT subscription with
+# it, and THAT is the loss nothing can recover.
+#
+# So the budget rations backlog and memory. Unbounded it would be the ladder's own 3.5s of sleeps
+# plus four aiohttp timeouts of 10s each — some 43s of accumulating queue per flush, on every
+# flush, for as long as InfluxDB is down. It exceeds the sleeps (3.5s) so that a fast-failing
+# InfluxDB still gets all three retries; a slow-failing one gets however many fit.
 RETRY_BUDGET = 5.0
+
+# Ceiling on aiomqtt's incoming queue, which defaults to unbounded (`maxsize=0`). Bounded, a stall
+# ends in messages discarded with "Message queue is full" in the log — visible, per-message,
+# recoverable the moment the drain catches up. Unbounded it ends in an OOM kill, which drops the
+# subscription and every batch in memory with it. The number is deliberately generous: at this
+# service's real rate (612M messages over its life, tens per second) it is on the order of an hour
+# of a total InfluxDB outage before the first message is discarded, while at roughly a kilobyte per
+# queued Message it caps the queue's own footprint near 50 MB — far below anything that would
+# threaten the host, and far above any backlog an ordinary InfluxDB restart can build.
+MAX_QUEUED_INCOMING_MESSAGES = 50_000
 
 
 class StreamProcessor:
@@ -45,9 +79,26 @@ class StreamProcessor:
         # The pending batch is shared between the message loop and the interval timer task, so every
         # read and write of it goes through the lock. Without it one task appends to the list while
         # the other swaps it out, and points are silently lost or written twice — a worse bug than
-        # the missing interval flush the timer exists to fix.
+        # the missing interval flush the timer exists to fix. One deliberate exception, spelled out
+        # where it happens: the cancellation handler in _flush puts its batch back without the lock.
         self._batch: list = []
         self._batch_lock = asyncio.Lock()
+
+        # When the batch was last emptied — by the timer, by a size-driven flush or by a tick that
+        # found nothing to send. The interval is measured from HERE and not from the timer's own
+        # last wakeup, which is what the original in-loop check did: a flush is a flush whoever
+        # triggered it, and a tick landing milliseconds after a full batch went out should wait
+        # rather than send the one point that has arrived since.
+        # Stamped when the batch is TAKEN, not when the write it started finishes: the promise in
+        # README is about how long a point may sit unsent, and tying the clock to the write instead
+        # would let one 10s InfluxDB timeout hold the next interval flush off for 10s+BATCH_INTERVAL
+        # while the backlog it is supposed to drain keeps growing.
+        self._last_flush_monotonic = time.monotonic()
+
+        # Start time of the flush whose result the last_flush_* fields below are showing. Two
+        # flushes can be in flight at once and can finish in the opposite order to the one they
+        # started in; see _record_flush.
+        self._last_stats_started = float("-inf")
 
         # stats
         self.msgs_received = 0
@@ -98,8 +149,15 @@ class StreamProcessor:
             await writer.stop()
 
     async def _write_with_retries(self, writer: InfluxWriter, points: list) -> bool:
-        if await writer.write_batch(points):
+        ok, worth_retrying = await writer.write_batch_detailed(points)
+        if ok:
             return True
+        if not worth_retrying:
+            # A 400 on a body InfluxDB will not parse, a 401 on a rotated password, a 404 on a
+            # database somebody dropped: the same bytes get the same answer until a human changes
+            # something. Repeating them buys nothing and spends RETRY_BUDGET per batch of a message
+            # loop that is meanwhile not draining the broker's queue.
+            return False
         # asyncio.timeout, not a plain elapsed-time check: the check can only run between attempts,
         # so an attempt that hangs in aiohttp's 10s timeout would blow the budget it is supposed to
         # respect. Cancelling mid-attempt is what makes RETRY_BUDGET an actual ceiling.
@@ -107,18 +165,40 @@ class StreamProcessor:
             async with asyncio.timeout(RETRY_BUDGET):
                 for delay in RETRY_DELAYS:
                     await asyncio.sleep(delay)
-                    if await writer.write_batch(points):
+                    ok, worth_retrying = await writer.write_batch_detailed(points)
+                    if ok:
                         self.retries += 1
                         return True
+                    if not worth_retrying:
+                        return False
         except TimeoutError:
             pass
         return False
+
+    def _record_flush(self, started: float, count: int, ok: bool):
+        # Two flushes can be inside their write at the same time — the lock is released before the
+        # write, deliberately — and they can finish in the opposite order to the one they started
+        # in. Last to finish used to win, so a slow failing flush landing after a fast successful
+        # one left the dashboard showing last_flush_ok=False next to the count of a batch that had
+        # already been superseded. Nothing happens to the data; what breaks is the only indicator
+        # an operator has for whether the bridge is healthy. The flush that STARTED later wins
+        # instead: it is the one whose answer describes the more recent state of InfluxDB.
+        if started < self._last_stats_started:
+            return
+        self._last_stats_started = started
+        self.last_flush_time = time.time()
+        self.last_flush_count = count
+        self.last_flush_ok = ok
 
     async def _flush(self, writer: InfluxWriter, *, retry: bool = True):
         # The lock is taken HERE rather than at the call sites, so that no caller can forget it. The
         # flip side: nothing reachable from this method may call it again, because asyncio.Lock is
         # not reentrant and that would deadlock the stream permanently.
         async with self._batch_lock:
+            # Moved even when there is nothing to send. An idle stream's tick is still a moment at
+            # which the batch was empty, so the next tick is a whole interval away instead of the
+            # loop spinning on a deadline that is permanently in the past.
+            self._last_flush_monotonic = time.monotonic()
             if not self._batch:
                 return
             pending, self._batch = self._batch, []
@@ -128,10 +208,33 @@ class StreamProcessor:
         # the lock across it would block the message loop from appending for exactly that long —
         # which is the throughput problem the retries already have to be rationed against.
         count = len(pending)
-        ok = await (self._write_with_retries(writer, pending) if retry else writer.write_batch(pending))
-        self.last_flush_time = time.time()
-        self.last_flush_count = count
-        self.last_flush_ok = ok
+        started = time.monotonic()
+        try:
+            ok = await (self._write_with_retries(writer, pending) if retry else writer.write_batch(pending))
+        except asyncio.CancelledError:
+            # From the swap above until this write returns, `pending` is the ONLY reference to
+            # these points — they are already out of self._batch. A cancellation arriving mid-write
+            # is not exotic: it is what a container stop is, and Portainer's updater recreates this
+            # container on every push of :latest. Without this the shutdown flush that follows
+            # would look at an empty self._batch, return immediately, and up to BATCH_SIZE points
+            # would vanish with no error counted, no event emitted and no line in the log.
+            #
+            # Put back at the FRONT: the message loop keeps appending while a write is in flight,
+            # and those points are newer than these.
+            #
+            # Deliberately NOT under self._batch_lock. Both statements are synchronous, and on a
+            # single-threaded event loop a run of statements with no await in it cannot interleave
+            # with another task — which is also why every critical section that lock does guard is
+            # await-free, so no task can be suspended while holding it and the fast path would be
+            # all this ever took. Taking it anyway would put a suspension point inside a
+            # cancellation handler, the one place where a second cancellation would destroy exactly
+            # the points being rescued.
+            self._batch[:0] = pending
+            self.batch_current = len(self._batch)
+            logger.warning(
+                "[%s] Write cancelled mid-flight, %d points returned to the batch", self.cfg.id, count)
+            raise
+        self._record_flush(started, count, ok)
         if ok:
             self.points_sent += count
             self.batches_sent += 1
@@ -151,7 +254,17 @@ class StreamProcessor:
         # Only a task with a clock of its own can make the "or" true. BATCH_INTERVAL is read on
         # every pass so the module attribute stays the single source of truth.
         while True:
-            await asyncio.sleep(BATCH_INTERVAL)
+            # The remainder of the interval, not the whole of it: the batch may have gone out on
+            # size while this task slept, and sleeping a full interval from the WAKEUP rather than
+            # from the last flush is what made a tick land milliseconds after a size-driven flush
+            # and post a batch of one or two points. sleep() is called even when the deadline has
+            # already passed — with BATCH_INTERVAL at 0 this loop would otherwise never yield,
+            # because _flush's lock acquisition has a fast path that does not suspend, and the
+            # message loop would never run again.
+            remaining = BATCH_INTERVAL - (time.monotonic() - self._last_flush_monotonic)
+            await asyncio.sleep(remaining if remaining > 0 else 0)
+            if time.monotonic() - self._last_flush_monotonic < BATCH_INTERVAL:
+                continue
             try:
                 await self._flush(writer)
             except asyncio.CancelledError:
@@ -185,6 +298,7 @@ class StreamProcessor:
                     hostname=self.cfg.mqtt_host,
                     port=self.cfg.mqtt_port,
                     timeout=10,
+                    max_queued_incoming_messages=MAX_QUEUED_INCOMING_MESSAGES,
                 )
                 if self.cfg.mqtt_user:
                     client_kwargs["username"] = self.cfg.mqtt_user
@@ -256,6 +370,15 @@ class StreamProcessor:
                 # final flush would race it for the same batch; then the last flush runs WITHOUT the
                 # retry ladder, so a shutdown never waits out its sleeps against a dead InfluxDB.
                 timer.cancel()
+                # And the timer is AWAITED before that flush, not merely cancelled. cancel() only
+                # schedules the cancellation, and the timer may be sitting in the middle of its own
+                # write with the whole batch held in a local — at BATCH_INTERVAL=3 against a slow
+                # InfluxDB that is where it spends most of its life. It hands those points back to
+                # self._batch when the cancellation actually reaches it, which is a later pass of
+                # the event loop than this one; flushing first would write an empty batch, return,
+                # and leave the timer's points in memory with nothing left running to send them.
+                with suppress(asyncio.CancelledError):
+                    await timer
                 await self._flush(writer, retry=False)
                 raise
             except Exception as e:
