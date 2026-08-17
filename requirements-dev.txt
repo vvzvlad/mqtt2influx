@@ -7,6 +7,13 @@
 
 pytest==9.1.1
 
+# The batching, retry and timer logic in src/mqtt_processor.py is all `async def`, and plain pytest
+# neither awaits a coroutine test nor provides an event loop for one — it collects the test, sees a
+# coroutine object come back instead of an assertion, and reports it as PASSED with a warning. So
+# without this plugin the async tests are not merely absent, they are silently green. 1.4.0 is the
+# version whose `pytest<10,>=8.4` range covers the pytest pinned above.
+pytest-asyncio==1.4.0
+
 # Required by `fastapi.testclient.TestClient`, which is what tests/test_api.py drives the whole REST
 # surface through. starlette's TestClient is a thin wrapper over an httpx client with an ASGI
 # transport, and it does `import httpx` at module import time — but plain `fastapi` does not depend
