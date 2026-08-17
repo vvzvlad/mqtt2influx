@@ -1,1 +1,10 @@
-__pycache__
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.pytest_cache/
+.DS_Store
+
+# Runtime state. data/streams.json holds every stream's MQTT and InfluxDB
+# credentials — this repository is public.
+data/
