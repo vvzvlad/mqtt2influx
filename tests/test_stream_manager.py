@@ -261,9 +261,10 @@ async def test_restarting_a_stream_that_was_not_running_just_starts_it(processor
 async def test_stop_all_stops_every_stream_and_empties_the_registry(processors):
     """Called from the lifespan's shutdown, which is the container's last chance to flush.
 
-    `_process_forever` catches the cancellation `stop()` delivers and flushes the pending batch
-    without the retry ladder — so a stream this loop skips loses whatever was in its batch, up to
-    BATCH_SIZE points, on every deploy. The iteration is over `list(self._processors)` because
+    Leaving its message loop is what makes a processor flush — `_connect_and_process` does it from a
+    `finally`, without the retry ladder — and the cancellation `stop()` delivers is what makes it
+    leave. So a stream this loop skips never flushes at all and loses whatever was in its batch, up
+    to BATCH_SIZE points, on every deploy. The iteration is over `list(self._processors)` because
     `stop_stream` mutates the dictionary it would otherwise be walking.
     """
     mgr = StreamManager()
@@ -288,6 +289,15 @@ async def test_stop_all_takes_every_stream_down_at_the_same_time(monkeypatch):
 
     The doubles here block until all three have entered `stop()`, so a serialised `stop_all` cannot
     finish at all: the first one waits for a signal only the third can send.
+
+    WHERE THE BOUND LIVES IS THE TEST. The rendezvous used to be `wait_for(..., timeout=2)` inside
+    the double, and that made the whole thing pass on a `for sid in ...: await self.stop_stream(sid)`
+    that swallowed exceptions — the obvious "simplification", and one the neighbouring test about
+    tolerating a failure invites: each stop simply waited out its own two seconds, the loop finished
+    in six, and both assertions below held. A serialised implementation must not have an escape
+    hatch, so the doubles now wait unbounded and the bound sits on the caller instead. Cancelled
+    from there, a stop_all that cannot finish fails as a TimeoutError on this test's own line rather
+    than by hanging the suite — there is no per-test timeout plugin in this project.
     """
     total = 3
     entered = []
@@ -304,14 +314,14 @@ async def test_stop_all_takes_every_stream_down_at_the_same_time(monkeypatch):
             entered.append(self.cfg.id)
             if len(entered) == total:
                 all_entered.set()
-            await asyncio.wait_for(all_entered.wait(), timeout=2)
+            await all_entered.wait()
 
     monkeypatch.setattr(stream_manager, "StreamProcessor", _BlockingProcessor)
     mgr = StreamManager()
     for stream_id in ("a", "b", "c"):
         await mgr.start_stream(_cfg(stream_id))
 
-    await mgr.stop_all()
+    await asyncio.wait_for(mgr.stop_all(), timeout=5)
 
     assert sorted(entered) == ["a", "b", "c"]
     assert mgr._processors == {}

@@ -14,6 +14,8 @@ supplied by whoever can publish to the broker, so every character with a meaning
 has to be neutralised here or it is neutralised nowhere.
 """
 
+import asyncio
+
 import aiohttp
 import pytest
 
@@ -509,6 +511,61 @@ async def test_write_batch_stays_a_plain_bool_over_the_detailed_answer():
 
     writer, _session = _writer_with_fake_session(_FakeResponse(status=401, text="nope"))
     assert await writer.write_batch([("m", 1.0, 1)]) is False
+
+
+# ── a cancellation is not a failed write ──────────────────────────────────────────────────────────
+
+async def test_a_cancellation_leaves_the_real_writer_instead_of_becoming_a_failed_write():
+    """The one test in this file that opens a socket, and it has to.
+
+    Everything the shutdown path rescues rests on a detail of `write_batch_detailed` that is invisible
+    from the outside: it catches `Exception`, and `asyncio.CancelledError` is a `BaseException`, so a
+    cancellation walks straight through it. That is what lets `_flush` see the cancellation at all —
+    and `_flush` is the only thing that puts the in-flight batch back into `self._batch` before the
+    final flush goes looking for it. Widen that handler to `BaseException` (an easy edit to make: the
+    module carries `# pylint: disable=broad-exception-caught`, and "catch everything" reads like the
+    same intent) and the cancelled write instead answers `(False, ...)`. The retry ladder then keeps
+    sleeping and re-sending after a swallowed cancellation, the task never ends, `stop()` waits out
+    the whole grace period, and up to BATCH_SIZE points are dropped with no error counted.
+
+    Not one test in the rest of the suite would notice: every processor test drives a `FakeWriter`,
+    so the real writer never runs under a cancellation anywhere else. Hence a real aiohttp request
+    against a real listener — a loopback server that accepts the connection and then answers nothing,
+    which is what an InfluxDB wedged mid-restart looks like. Mocking aiohttp would prove the double
+    re-raises, which is not the claim.
+    """
+    accepted = asyncio.Event()
+    peers = []
+
+    async def hold(reader, peer):
+        # Answer nothing and keep the socket open: returning from the handler closes it, aiohttp
+        # reads a disconnect and the write completes as a failure — the opposite of the state under
+        # test. `read()` returns when the client goes away, which is this handler's own cleanup.
+        peers.append(peer)
+        accepted.set()
+        await reader.read()
+
+    server = await asyncio.start_server(hold, "127.0.0.1", 0)
+    writer = InfluxWriter(
+        host="127.0.0.1", port=server.sockets[0].getsockname()[1],
+        user="", password="", database="db", stream_id="s")
+    await writer.start()
+    try:
+        write = asyncio.create_task(writer.write_batch_detailed([("m", 1.0, 1)]))
+        await asyncio.wait_for(accepted.wait(), timeout=5)
+
+        write.cancel()
+
+        # The assertion is the SHAPE of the exit, not a value. A `(False, True)` here is a
+        # cancellation that was swallowed and reported as an ordinary failed write.
+        with pytest.raises(asyncio.CancelledError):
+            await write
+    finally:
+        await writer.stop()
+        for peer in peers:
+            peer.close()
+        server.close()
+        await server.wait_closed()
 
 
 async def test_no_auth_header_is_sent_when_no_user_is_configured():

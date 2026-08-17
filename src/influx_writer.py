@@ -112,6 +112,15 @@ def make_line(measurement: str, value: float, timestamp_ms: int) -> str:
 # InfluxDB's line parser refuses (400) — and the same bytes will get the same answer for as long as
 # the cause lasts. 429 and 5xx are the database being overloaded, restarting, or proxied by
 # something that is: a second later the identical body can succeed.
+#
+# This split assumes the bridge talks to InfluxDB DIRECTLY. influx_host/influx_port come from
+# streams.json and may well name a reverse proxy, and Traefik answers 404 — not 503 — for the
+# seconds a docker-provider backend is being recreated, which is exactly the outage the ladder
+# exists for. 404 is still classed as permanent on purpose: it also means "the database was
+# dropped", and 401 means "the password was rotated", and retrying those costs the whole budget
+# per batch, forever, in a loop that is not draining the broker queue while it waits. Losing one
+# batch to a proxy blip is bounded and shows up in `errors`; the other way round is not. Fix that
+# case at the proxy — make it answer 502/503 for a missing backend — not here.
 RETRY_AFTER_STATUSES = frozenset({429})
 
 
