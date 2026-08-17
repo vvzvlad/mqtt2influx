@@ -64,7 +64,12 @@ class StreamManager:
         return proc.get_stats() if proc else {}
 
     def is_running(self, stream_id: str) -> bool:
-        return stream_id in self._processors
+        # Asks the processor's task, not the dictionary. A processor whose `_run` died — an
+        # exception before the message loop is entered, say — is never removed from `_processors`,
+        # so the key outlives the task and GET /api/streams reported `running: true` for a stream
+        # that had stopped writing points.
+        proc = self._processors.get(stream_id)
+        return proc.is_alive if proc else False
 
 
 manager = StreamManager()
