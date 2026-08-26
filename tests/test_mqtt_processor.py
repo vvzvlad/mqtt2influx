@@ -140,14 +140,15 @@ def install_disconnecting_client(monkeypatch, on_construct):
     monkeypatch.setattr(mqtt_processor.aiomqtt, "Client", _FakeClient)
 
 
-def make_processor(stream_id="s1"):
+def make_processor(stream_id="s1", **cfg_overrides):
     events = []
 
     async def on_event(sid, event_type, data):
         events.append((sid, event_type, data))
         await asyncio.sleep(0)  # a real broadcast reaches websockets and suspends
 
-    proc = StreamProcessor(StreamConfig(id=stream_id, name="t", mqtt_topic="#"), on_event=on_event)
+    proc = StreamProcessor(
+        StreamConfig(id=stream_id, name="t", mqtt_topic="#", **cfg_overrides), on_event=on_event)
     proc.events = events
     return proc
 
@@ -427,6 +428,68 @@ async def test_the_timer_and_the_message_loop_never_lose_or_duplicate_a_point(mo
     written = [topic for call in writer.calls for topic, _value, _ts in call]
     assert len(written) == total
     assert sorted(written) == sorted(f"dev/p{i:04d}" for i in range(total))
+
+
+# --- the stream's own precision, from streams.json to the batched point ---------------------------
+#
+# tests/test_influx_writer.py pins what each precision DOES. These two pin the wiring: that the
+# number in streams.json is the number the rounding is given. Everything in between is a chain of
+# defaults that each keep working on their own if a link comes loose — StreamConfig defaults to
+# None, resolve_value_precision turns None into 2, flatten_payload defaults to 2 — so a processor
+# that dropped the config entirely would round to two decimals and look completely healthy.
+
+async def test_a_streams_configured_precision_reaches_the_points_it_batches(monkeypatch):
+    """The kiln stream, end to end: what it sets is what lands in the batch.
+
+    Deliberately checked through the batch and not through `to_number`, because every layer between
+    them defaults to the same two decimals. If `StreamProcessor` ignored `cfg.value_precision`
+    outright, every unit test of the rounding would still pass and this is the only thing that
+    would go red.
+    """
+    monkeypatch.setattr(mqtt_processor, "BATCH_SIZE", 1)
+    queue = asyncio.Queue()
+    install_fake_client(monkeypatch, queue)
+
+    proc = make_processor(value_precision=-1)
+    writer = FakeWriter()
+    proc._running = True
+    task = asyncio.create_task(proc._connect_and_process(writer))
+    queue.put_nowait(FakeMessage(
+        "ue/kiln", '{"calibration_coeff_a": 0.00003618, "adc_raw": 10.74805}'))
+
+    try:
+        assert await eventually(lambda: writer.calls), "the batch never reached the writer"
+    finally:
+        await _stop(proc, task)
+
+    assert sorted((topic, value) for topic, value, _ts in writer.calls[0]) == [
+        ("ue/kiln/adc_raw", 10.74805),
+        ("ue/kiln/calibration_coeff_a", 0.00003618),
+    ]
+
+
+async def test_a_stream_that_configures_nothing_still_batches_two_decimals(monkeypatch):
+    """The same path with an untouched config — the shape every production stream is in today."""
+    monkeypatch.setattr(mqtt_processor, "BATCH_SIZE", 1)
+    queue = asyncio.Queue()
+    install_fake_client(monkeypatch, queue)
+
+    proc = make_processor()
+    writer = FakeWriter()
+    proc._running = True
+    task = asyncio.create_task(proc._connect_and_process(writer))
+    queue.put_nowait(FakeMessage(
+        "ue/kiln", '{"calibration_coeff_a": 0.00003618, "adc_raw": 10.74805}'))
+
+    try:
+        assert await eventually(lambda: writer.calls), "the batch never reached the writer"
+    finally:
+        await _stop(proc, task)
+
+    assert sorted((topic, value) for topic, value, _ts in writer.calls[0]) == [
+        ("ue/kiln/adc_raw", 10.75),
+        ("ue/kiln/calibration_coeff_a", 0.0),
+    ]
 
 
 # --- bug 3: the dead auth placeholder ------------------------------------------------------------

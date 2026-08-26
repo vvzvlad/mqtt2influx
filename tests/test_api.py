@@ -211,6 +211,59 @@ def test_put_on_an_unknown_id_returns_404(client):
     assert response.status_code == 404
 
 
+def test_a_stream_created_without_a_precision_reports_it_as_unset(client):
+    """The default has to come back as null and not as 2, or "unset" stops being distinguishable.
+
+    The UI prefills its form from this response. If the server answered with the resolved 2, then
+    opening and saving a stream would write an explicit `"value_precision": 2` into streams.json —
+    turning every edit into an opt-in to a key that an older image cannot read.
+    """
+    created = create(client)
+
+    assert created["value_precision"] is None
+    assert client.get("/api/streams").json()[0]["value_precision"] is None
+
+
+def test_put_sets_a_precision_and_it_reaches_the_config_file(client, data_dir):
+    """The operator's real path for turning rounding off on one stream, read back off disk."""
+    created = create(client)
+
+    response = client.put("/api/streams/{}".format(created["id"]), json={"value_precision": -1})
+    assert response.status_code == 200
+    assert response.json()["value_precision"] == -1
+
+    on_disk = load_streams()
+    assert on_disk[0].value_precision == -1
+    # Not sent in the PUT body, so it has to have been carried over rather than reset.
+    assert on_disk[0].influx_database == "metrics"
+
+
+def test_a_put_that_does_not_mention_the_precision_leaves_it_alone(client):
+    """Every other field is carried over on a partial PUT, and this one is not special.
+
+    Worth its own test because the carry-over reads `body.get(k, getattr(existing, k))`: a field
+    whose stored value is None is exactly the case where a `body.get(k)` written without the
+    fallback would look like it worked.
+    """
+    created = create(client, value_precision=8)
+
+    updated = client.put("/api/streams/{}".format(created["id"]), json={"name": "renamed"}).json()
+
+    assert updated["name"] == "renamed"
+    assert updated["value_precision"] == 8
+
+
+def test_put_can_clear_a_precision_back_to_the_default(client, data_dir):
+    """An explicit null is how the UI sends a cleared box, and it has to mean "unset" again."""
+    created = create(client, value_precision=-1)
+
+    path = "/api/streams/{}".format(created["id"])
+    updated = client.put(path, json={"value_precision": None}).json()
+
+    assert updated["value_precision"] is None
+    assert load_streams()[0].value_precision is None
+
+
 def test_delete_removes_the_stream(client):
     created = create(client)
 

@@ -214,6 +214,10 @@
         <label>InfluxDB Database</label>
         <input type="text" id="fInfluxDb" placeholder="home">
       </div>
+      <div class="form-group full">
+        <label>Value Precision — decimals (empty = 2, -1 = store as received)</label>
+        <input type="number" id="fValuePrecision" step="1" placeholder="2">
+      </div>
     </div>
     <div class="modal-footer">
       <button class="btn btn-ghost" onclick="closeModal()">Cancel</button>
@@ -445,6 +449,9 @@ function openModal(prefill) {
   document.getElementById('fInfluxUser').value = f.influx_user || '';
   document.getElementById('fInfluxPass').value = f.influx_password || '';
   document.getElementById('fInfluxDb').value = f.influx_database || '';
+  // ?? and not ||, because 0 is a legitimate precision (round to whole numbers) and || would
+  // blank the box for it, so saving an untouched form would silently reset the stream to 2.
+  document.getElementById('fValuePrecision').value = f.value_precision ?? '';
   document.getElementById('overlay').classList.add('open');
 }
 
@@ -457,6 +464,11 @@ async function saveStream() {
   const mqttHost = document.getElementById('fMqttHost').value.trim();
   const influxHost = document.getElementById('fInfluxHost').value.trim();
   const influxDb = document.getElementById('fInfluxDb').value.trim();
+  // An empty box means "not configured" and must travel as null, not as 0 — parseInt('') is NaN
+  // and JSON.stringify turns NaN into null anyway, but going through it deliberately keeps the
+  // "cleared field = the default two decimals" rule visible instead of accidental.
+  const precisionRaw = document.getElementById('fValuePrecision').value.trim();
+  const valuePrecision = precisionRaw === '' ? null : parseInt(precisionRaw, 10);
 
   if (!mqttHost) { alert('MQTT Host is required'); document.getElementById('fMqttHost').focus(); return; }
   if (!influxHost) { alert('InfluxDB Host is required'); document.getElementById('fInfluxHost').focus(); return; }
@@ -475,6 +487,7 @@ async function saveStream() {
     influx_user: document.getElementById('fInfluxUser').value.trim(),
     influx_password: document.getElementById('fInfluxPass').value,
     influx_database: influxDb,
+    value_precision: Number.isNaN(valuePrecision) ? null : valuePrecision,
     enabled: true,
   };
 

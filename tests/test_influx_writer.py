@@ -15,16 +15,20 @@ has to be neutralised here or it is neutralised nowhere.
 """
 
 import asyncio
+import logging
 
 import aiohttp
 import pytest
 
 from src.influx_writer import (
+    DEFAULT_VALUE_PRECISION,
     EXCLUDED_SUBSTRINGS,
     InfluxWriter,
+    RAW_VALUE_PRECISION,
     contains_excluded,
     flatten_payload,
     make_line,
+    resolve_value_precision,
     to_number,
 )
 
@@ -219,6 +223,263 @@ def test_a_bool_yields_a_python_int_while_a_number_yields_a_float():
     # And the difference as InfluxDB actually receives it — no `i` suffix on either.
     assert make_line("m", to_number(True), 1) == "m value=10 1"
     assert make_line("m", to_number(1.5), 1) == "m value=1.5 1"
+
+
+# ── value_precision: how many decimals reach InfluxDB ─────────────────────────────────────────────
+#
+# Context, because these tests are guarding two different things at once. Two decimals used to be
+# hardcoded into `_to_storable_float`, and the numbers above pin what that did to 604 million
+# points already in the database. The setting below lets ONE stream ask for something else without
+# any other stream noticing — so half of this section is about the new behaviour and half is about
+# proving the old behaviour is still what you get when nobody asks.
+
+def test_the_default_is_still_two_decimals_when_no_precision_is_given():
+    """The regression guard for every stream in production, and the reason the default is not None.
+
+    Two streams carry real traffic — a Wirenboard install at 134 million messages and a kiln bridge
+    at 4.9 million points — and neither of them will mention precision in streams.json. If the
+    default here ever became "no rounding", both would silently change what they write mid-series:
+    same measurement, same field, more decimals from one point onward. Nothing errors, nothing is
+    counted, and every dashboard built on the old numbers keeps drawing.
+    """
+    assert to_number(10.74805) == 10.75
+    assert to_number(5.678) == 5.68
+    assert list(flatten_payload("devices/x", {"temp": 10.74805})) == [("devices/x/temp", 10.75)]
+
+
+def test_a_stream_can_ask_for_more_decimals():
+    """The kiln's ADC readings, which is what the whole setting was added for.
+
+    `sensor/adc_raw` publishes 10.74805 and the Node-RED bridge it is being migrated off stores
+    exactly that. Through the old hardcoded rounding it arrives as 10.75 — three digits of a
+    calibrated analogue reading gone.
+    """
+    assert to_number(10.74805, 5) == 10.74805
+    assert to_number(10.83213, 5) == 10.83213
+    assert to_number(1.00722098, 8) == 1.00722098
+
+
+def test_a_precision_of_none_stores_the_number_exactly_as_it_arrived():
+    """The Node-RED parity mode: a number that came out of json.loads() is written untouched.
+
+    Node-RED rounds only the numeric STRINGS it sees (`parseFloat(n.toFixed(2))`) and passes an
+    already-parsed JSON number straight through. This is that behaviour, and it is the only setting
+    under which a kiln calibration coefficient survives at all.
+    """
+    assert to_number(0.00003618, None) == 0.00003618
+    assert to_number(10.74805, None) == 10.74805
+    assert to_number(1.00722098, None) == 1.00722098
+    assert to_number(1125.12, None) == 1125.12
+
+
+def test_a_fixed_precision_cannot_rescue_a_calibration_coefficient():
+    """Why "more decimals" is not a substitute for "do not round", spelled out with the real value.
+
+    `sensor/calibration_coeff_a` on kiln UE-932C8C4AEA2F reads 0.00003618. Two decimals flatten it
+    to a stored 0.0 — not dropped, STORED, so the series looks like a working sensor reading zero.
+    Five decimals, the obvious "surely that is enough", still destroy it: the value only has four
+    leading zeros and rounding to five leaves 4e-05, a 10% error masquerading as precision.
+
+    The point is that the right precision depends on the magnitude of a coefficient nobody controls
+    — the next kiln calibrates to 1e-6 and eight decimals fail too — so the answer for that stream
+    is the no-rounding mode, not a bigger number.
+    """
+    assert to_number(0.00003618) == 0.0
+    assert to_number(0.00003618, 5) == 4e-05
+    assert to_number(0.00003618, 8) == 0.00003618
+    assert to_number(0.00003618, None) == 0.00003618
+
+
+def test_the_two_booleans_ignore_the_precision_completely():
+    """10 and 0 are markers this bridge invents, not readings, so there is nothing to round.
+
+    They also have to stay Python ints at every precision: `round(10, 8)` returns a float, and that
+    would change the body from `value=10` to `value=10.0` for every boolean topic on a stream that
+    only asked for more decimals on its analogue ones.
+    """
+    for precision in (DEFAULT_VALUE_PRECISION, 0, 5, 8, None):
+        assert to_number(True, precision) == 10
+        assert to_number(False, precision) == 0
+        assert type(to_number(True, precision)) is int
+        assert to_number("true", precision) == 10
+        assert to_number("FALSE", precision) == 0
+
+    assert make_line("m", to_number(True, None), 1) == "m value=10 1"
+
+
+def test_a_numeric_string_takes_the_same_precision_as_a_number():
+    """Whether a device quotes its reading in JSON must not decide how much of it is kept.
+
+    A quoted "10.74805" and a bare 10.74805 are the same measurement, and they go through the same
+    `_to_storable_float` — the branch above them in `to_number` only decides how the value got
+    there. Worth pinning because Node-RED, the bridge being migrated off, does exactly the opposite:
+    it rounds the string form and leaves the parsed form alone.
+    """
+    assert to_number("10.74805") == 10.75
+    assert to_number("10.74805", 5) == 10.74805
+    assert to_number("10.74805", None) == 10.74805
+    assert to_number("0.00003618", None) == 0.00003618
+    assert to_number("-4.5", None) == -4.5
+
+
+def test_whole_numbers_come_through_every_precision_unchanged():
+    """Nothing to round away, so every setting has to agree — including the no-rounding one."""
+    for precision in (DEFAULT_VALUE_PRECISION, 0, 8, None):
+        assert to_number(12, precision) == 12.0
+        assert to_number("12", precision) == 12.0
+        assert to_number(-7, precision) == -7.0
+        assert type(to_number(12, precision)) is float
+
+
+def test_a_precision_of_zero_rounds_to_whole_numbers():
+    """0 is a real setting and not a synonym for "unset", which is why null is what means unset.
+
+    If an empty field in the UI ever arrived as 0 instead of null, a stream would quietly start
+    storing integers — so this pins that 0 does something specific and different from the default.
+    """
+    assert to_number(10.74805, 0) == 11.0
+    assert to_number(5.4, 0) == 5.0
+
+
+@pytest.mark.parametrize("value", [
+    float("nan"), float("inf"), float("-inf"),
+    "nan", "Infinity",
+    1e400,
+])
+def test_a_value_influxdb_cannot_parse_is_still_dropped_when_nothing_is_rounded(value):
+    """The `math.isfinite` guard has to survive the no-rounding path, or it stops guarding.
+
+    Skipping `round()` moved that check to the other side of a branch. If it had been skipped along
+    with the rounding, a stream in no-rounding mode would render `value=nan` into the body and
+    InfluxDB 1.x would reject the ENTIRE request — the other 219 points batched with it included,
+    followed by a retry ladder against a 400 that never changes. That is a bigger failure than the
+    rounding this setting exists to avoid.
+    """
+    assert to_number(value, None) is None
+
+
+def test_an_integer_too_large_for_a_float_is_still_dropped_when_nothing_is_rounded():
+    """The OverflowError comes from `float()`, which runs before the rounding either way."""
+    assert to_number(10 ** 400, None) is None
+    assert to_number(10 ** 400, 8) is None
+
+
+def test_the_precision_reaches_every_leaf_of_a_nested_document():
+    """One MQTT message becomes many points, and the setting is per stream, not per point.
+
+    The kiln publishes its whole state as one JSON document, so if the precision stopped at the
+    first level of recursion the coefficients — which are exactly the values that need it — would
+    be the ones that lost it.
+    """
+    payload = {
+        "sensor": {"adc_raw": 10.74805, "calibration_coeff_a": 0.00003618},
+        "kiln_temp": 1125.12,
+    }
+
+    assert sorted(flatten_payload("ue/932c8c4aea2f", payload, None)) == [
+        ("ue/932c8c4aea2f/kiln_temp", 1125.12),
+        ("ue/932c8c4aea2f/sensor/adc_raw", 10.74805),
+        ("ue/932c8c4aea2f/sensor/calibration_coeff_a", 0.00003618),
+    ]
+    assert sorted(flatten_payload("ue/932c8c4aea2f", payload)) == [
+        ("ue/932c8c4aea2f/kiln_temp", 1125.12),
+        ("ue/932c8c4aea2f/sensor/adc_raw", 10.75),
+        ("ue/932c8c4aea2f/sensor/calibration_coeff_a", 0.0),
+    ]
+
+
+def test_no_rounding_renders_a_small_coefficient_as_scientific_notation():
+    """What actually goes into the request body, because `str(3.618e-05)` is not `0.00003618`.
+
+    InfluxDB 1.x parses a float field with Go's ParseFloat and documents `1.e+78` as a valid value,
+    so this is accepted — and it is not new either: `str()` already produced this form for large
+    numbers under the old hardcoded rounding. Pinned because it is the one visible difference
+    between what the config says and what crosses the wire, and the place to look first if a
+    no-rounding stream ever starts collecting 400s.
+    """
+    assert make_line("m", to_number(0.00003618, None), 1) == "m value=3.618e-05 1"
+    assert make_line("m", to_number(10.74805, None), 1) == "m value=10.74805 1"
+
+
+# ── resolve_value_precision: three config states, two rounding arguments ──────────────────────────
+
+def test_an_unset_precision_resolves_to_the_historical_two_decimals():
+    """Both spellings of "unset" — an absent key and an explicit null — land on the same default.
+
+    They have to. Every JSON producer treats them as interchangeable, so if they meant different
+    things then a UI that sends `"value_precision": null` for a cleared box and a config generator
+    that omits the key would configure the same stream two different ways.
+    """
+    assert resolve_value_precision(None) == DEFAULT_VALUE_PRECISION
+    assert resolve_value_precision(None) == 2
+
+
+def test_a_negative_precision_resolves_to_no_rounding_at_all():
+    """The sentinel, and the reason it is a negative number rather than a null.
+
+    `null` is what a cleared form field and an omitted key both produce, so spending it on "do not
+    round" would make the dangerous state the easy one to reach by accident. A negative number has
+    to be typed on purpose. Any negative value means it; -1 is the spelling the UI writes.
+    """
+    assert resolve_value_precision(RAW_VALUE_PRECISION) is None
+    assert resolve_value_precision(-1) is None
+    assert resolve_value_precision(-7) is None
+
+
+def test_a_non_negative_precision_is_passed_through_as_the_number_of_decimals():
+    assert resolve_value_precision(0) == 0
+    assert resolve_value_precision(2) == 2
+    assert resolve_value_precision(5) == 5
+    assert resolve_value_precision(8) == 8
+
+
+@pytest.mark.parametrize("configured", [2.0, "2", "", "eight", [], {}])
+def test_a_precision_that_is_not_an_integer_falls_back_to_the_default(configured, caplog):
+    """streams.json is hand-edited, and `round(x, 2.0)` is a TypeError inside the message loop.
+
+    Raising there would escape flatten_payload, be caught by `_process_forever`'s outer `except
+    Exception` and cost a five-second reconnect — per message, for as long as the typo lasts, on a
+    subscription that buffers nothing while it is away. So a malformed setting degrades to the
+    default rather than taking the stream down.
+
+    It degrades LOUDLY, though: a precision that is silently ignored is the exact failure this
+    setting was added to fix, and a stream that looks configured but is not is worse than one that
+    obviously is not.
+    """
+    with caplog.at_level(logging.WARNING, logger="src.influx_writer"):
+        assert resolve_value_precision(configured, "stream-id") == DEFAULT_VALUE_PRECISION
+
+    assert "value_precision" in caplog.text
+    assert "stream-id" in caplog.text
+
+
+def test_a_boolean_precision_is_rejected_rather_than_read_as_one_decimal(caplog):
+    """bool is a subclass of int, so `round(1.234, True)` is a legal call that rounds to 1 decimal.
+
+    Without an explicit bool check before the int check, `"value_precision": true` would be accepted
+    as a request for one decimal instead of reported as the mistake it is.
+    """
+    with caplog.at_level(logging.WARNING, logger="src.influx_writer"):
+        assert resolve_value_precision(True) == DEFAULT_VALUE_PRECISION
+        assert resolve_value_precision(False) == DEFAULT_VALUE_PRECISION
+
+    assert "value_precision" in caplog.text
+
+
+def test_the_resolved_none_is_never_handed_to_round():
+    """The trap this whole two-vocabulary split exists to avoid.
+
+    `round(1.234, None)` does not mean "do not round" — it is the same as `round(1.234)` and returns
+    the INT 1. So the no-rounding mode cannot be implemented by passing the resolved value straight
+    into `round()`; it has to be a branch that skips the call. If that ever regresses, every value
+    on a no-rounding stream becomes a whole number — the opposite of what was asked for, and far
+    more destructive than the two decimals it replaced.
+    """
+    assert round(1.234, None) == 1
+    assert type(round(1.234, None)) is int
+    # The real path, through the same resolved None:
+    assert to_number(1.234, resolve_value_precision(-1)) == 1.234
+    assert type(to_number(1.234, resolve_value_precision(-1))) is float
 
 
 # ── flatten_payload: JSON document to topic/value pairs ───────────────────────────────────────────

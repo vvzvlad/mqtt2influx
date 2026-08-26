@@ -27,6 +27,12 @@ class StreamConfig:
     influx_password: str = ""
     influx_database: str = ""
     enabled: bool = True
+    # Decimals every numeric value from this stream is rounded to before it is written.
+    # None — and an absent key, which is the same thing — means "not configured" and gets the two
+    # decimals this service has always applied. A negative number means "store it as it arrived".
+    # See DEFAULT_VALUE_PRECISION / RAW_VALUE_PRECISION in influx_writer.py for why the states are
+    # spelled this way, and _serialize() below for why an unset one never reaches the file.
+    value_precision: Optional[int] = None
 
 
 def _config_path():
@@ -65,6 +71,27 @@ def _fsync_directory(directory: str):
         os.close(fd)
 
 
+def _serialize(stream: StreamConfig) -> dict:
+    """asdict(), minus the optional keys this stream never set.
+
+    Adding a field to StreamConfig is not a free act, because `load_streams()` builds its objects
+    with `StreamConfig(**record)` and an undeclared keyword is a TypeError — which the bare `except`
+    below turns into an empty list, i.e. EVERY STREAM GONE, and the next save writes that emptiness
+    back over the file. The version of the code that will choke is not this one, it is whatever
+    older image someone rolls back to after this one has already rewritten streams.json.
+
+    Writing `value_precision` only when it is actually set is what keeps that door shut for the
+    streams that do not use the feature: their record stays byte-for-byte the record an older image
+    already knows how to read, so a rollback is as safe as it was before this field existed. A
+    stream that DOES opt in carries the key and an older image would refuse the whole file — that
+    one is unavoidable, is the price of the setting, and is written down in README.
+    """
+    record = asdict(stream)
+    if record.get("value_precision") is None:
+        del record["value_precision"]
+    return record
+
+
 def save_streams(streams: List[StreamConfig]):
     path = _config_path()
     # Written beside the target and renamed over it, never opened in place: `open(path, "w")`
@@ -79,7 +106,7 @@ def save_streams(streams: List[StreamConfig]):
     tmp = path + ".tmp"
     try:
         with open(tmp, "w") as f:
-            json.dump([asdict(s) for s in streams], f, indent=2)
+            json.dump([_serialize(s) for s in streams], f, indent=2)
             f.flush()
             os.fsync(f.fileno())
         os.replace(tmp, path)

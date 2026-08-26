@@ -78,6 +78,11 @@ make run       # http://127.0.0.1:8000, DATA_DIR defaults to /data — override 
 - **`load_streams()` swallows every error and returns `[]`.** A corrupt or schema-mismatched
   `streams.json` is therefore indistinguishable from an empty one, and the next save overwrites
   it. Worth remembering when a stream "disappears".
+  This is also why adding a field to `StreamConfig` is a compatibility event and not a free act:
+  an older image reading a key it does not declare loses EVERY stream, not the one record. The
+  optional `value_precision` field is written only when a stream actually sets it (`_serialize` in
+  `src/config.py`) so that untouched records stay readable by older builds — copy that pattern for
+  any field added later, and see the caveat in README before rolling an image back.
 - **`StaticFiles(html=True)` is NOT an SPA catch-all.** It looks for a `404.html`, does not find
   one in `static/`, and returns 404. Verified against the starlette source and asserted in both
   the test suite and the gate.

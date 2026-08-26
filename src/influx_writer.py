@@ -5,7 +5,7 @@
 import logging
 import math
 import time
-from typing import List, Tuple
+from typing import List, Optional, Tuple
 import aiohttp
 
 logger = logging.getLogger(__name__)
@@ -34,10 +34,68 @@ def contains_excluded(topic: str) -> bool:
     return any(sub in topic for sub in EXCLUDED_SUBSTRINGS)
 
 
-def _to_storable_float(value):
-    """round(float(value), 2), or None for anything InfluxDB could not store anyway."""
+# How many decimals a value is rounded to when the stream does not ask for anything else. Two is
+# what this service has always done, to every number, unconditionally — 604 million points were
+# written under that rule and every dashboard and continuous query downstream was built on top of
+# it. So it stays the default: a stream that says nothing about precision must keep writing exactly
+# the numbers it wrote yesterday.
+DEFAULT_VALUE_PRECISION = 2
+
+# The `value_precision` a stream sets to be stored unrounded. Any negative number means the same
+# thing; -1 is the canonical spelling and the one the UI writes.
+#
+# A negative sentinel rather than a null, and that is the whole design decision. The three states a
+# stream needs are "not configured", "N decimals" and "do not round", but a single Optional[int]
+# field only spells two of them, so one state has to be encoded. Null is the wrong one to spend:
+# an absent key and an explicit `null` are the same thing to every JSON producer there is — a
+# cleared number input in the UI, a config generator filling in blanks — and if `null` meant "do
+# not round" then clearing that box on the Wirenboard stream would silently switch 134 million
+# messages a year to full precision. So both spellings of "unset" collapse to the default, and the
+# dangerous state is the one you have to type on purpose. `round(x, -1)` does mean "round to tens"
+# in Python, which is what this steals; no telemetry bridge has ever wanted that.
+RAW_VALUE_PRECISION = -1
+
+
+def resolve_value_precision(configured, stream_id: str = "") -> Optional[int]:
+    """Turn a stream's configured `value_precision` into the argument the rounding takes.
+
+    Two layers, two vocabularies, and they are deliberately not the same one. The CONFIG has three
+    states (unset, N decimals, do not round) because an operator needs all three; the rounding has
+    two (an int, or None for "skip the round() call"). This is the one place that maps between
+    them, so `None` never has to mean two different things in the same scope.
+    """
+    if configured is None:
+        return DEFAULT_VALUE_PRECISION
+    # bool BEFORE int, because bool is a subclass of int and `round(1.234, True)` is a legal call
+    # that quietly rounds to one decimal. `"value_precision": true` in a hand-edited streams.json
+    # is a mistake, not a request for one decimal.
+    if isinstance(configured, bool) or not isinstance(configured, int):
+        # Includes the float and the string forms — `2.0` and `"2"` both come back from json.load()
+        # looking close enough to right to be typed by accident, and `round(x, 2.0)` raises
+        # TypeError, which inside flatten_payload would cost a five-second reconnect per message.
+        # Falling back to the default keeps the stream writing; the warning is what makes the
+        # silence stop, because a precision that is quietly ignored is exactly the bug this whole
+        # setting exists to fix.
+        logger.warning(
+            "[%s] Ignoring value_precision=%r: expected an integer. Falling back to %d decimals.",
+            stream_id, configured, DEFAULT_VALUE_PRECISION)
+        return DEFAULT_VALUE_PRECISION
+    if configured < 0:
+        return None
+    return configured
+
+
+def _to_storable_float(value, precision: Optional[int] = DEFAULT_VALUE_PRECISION):
+    """round(float(value), precision), or None for anything InfluxDB could not store anyway.
+
+    `precision=None` stores the number as it arrived — which is what Node-RED does for a value that
+    came out of json.loads() already numeric, and the only setting under which a calibration
+    coefficient like 0.00003618 survives the trip at all. Note that it has to be a branch and not
+    `round(num, precision)` with a None: `round(1.234, None)` is not "do not round", it returns the
+    INT 1, so passing the None straight through would turn every value into an integer.
+    """
     try:
-        num = round(float(value), 2)
+        num = float(value)
     except ValueError:
         return None
     except OverflowError:
@@ -46,6 +104,8 @@ def _to_storable_float(value):
         # the outer `except Exception` in _process_forever and cost a five-second reconnect —
         # one device publishing a 400-digit number would throttle the whole stream.
         return None
+    if precision is not None:
+        num = round(num, precision)
     if not math.isfinite(num):
         # NaN and the infinities arrive by three routes that all look ordinary: json.loads("NaN")
         # and json.loads("Infinity") accept them by default, float("nan") parses the plain string
@@ -59,30 +119,36 @@ def _to_storable_float(value):
     return num
 
 
-def to_number(value):
+def to_number(value, precision: Optional[int] = DEFAULT_VALUE_PRECISION):
+    # The two booleans do NOT go through the rounding, at any precision: 10 and 0 are markers this
+    # bridge invents, not measurements, and `round(10, 8)` would turn the int into a float and
+    # change the line protocol it writes from `value=10` to `value=10.0`.
     if isinstance(value, bool):
         return 10 if value else 0
     if isinstance(value, (int, float)):
-        return _to_storable_float(value)
+        return _to_storable_float(value, precision)
     if isinstance(value, str):
         low = value.lower()
         if low == "true":
             return 10
         if low == "false":
             return 0
-        return _to_storable_float(value)
+        # A numeric string takes the same precision as a number would. Node-RED's bridge rounds
+        # exactly here and nowhere else, which is how the same reading ends up stored two different
+        # ways depending only on whether the device quoted it in its JSON.
+        return _to_storable_float(value, precision)
     return None
 
 
-def flatten_payload(topic: str, payload):
+def flatten_payload(topic: str, payload, precision: Optional[int] = DEFAULT_VALUE_PRECISION):
     """Recursively expand JSON objects into flat topic/value pairs."""
     if isinstance(payload, dict):
         suffix = "" if topic.endswith("/") else "/"
         for key, val in payload.items():
             if not key.startswith("_"):
-                yield from flatten_payload(f"{topic}{suffix}{key}", val)
+                yield from flatten_payload(f"{topic}{suffix}{key}", val, precision)
     else:
-        num = to_number(payload)
+        num = to_number(payload, precision)
         if num is not None:
             clean_topic = topic.replace(" ", "_").lower()
             yield clean_topic, num
