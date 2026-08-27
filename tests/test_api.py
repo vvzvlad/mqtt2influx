@@ -20,6 +20,7 @@ from fastapi.testclient import TestClient
 from src import api
 from src.api import app
 from src.config import StreamConfig, load_streams, save_streams
+from src.influx_writer import DEFAULT_VALUE_PRECISION, resolve_value_precision
 from src.stream_manager import manager
 
 
@@ -209,6 +210,161 @@ def test_put_updates_a_field_and_leaves_the_rest_alone(client):
 def test_put_on_an_unknown_id_returns_404(client):
     response = client.put("/api/streams/no-such-id", json={"name": "x"})
     assert response.status_code == 404
+
+
+def test_a_stream_created_without_a_precision_reports_it_as_unset(client):
+    """The default has to come back as null and not as 2, or "unset" stops being distinguishable.
+
+    The UI prefills its form from this response. If the server answered with the resolved 2, then
+    opening and saving a stream would write an explicit `"value_precision": 2` into streams.json —
+    turning every edit into an opt-in to a key that an older image cannot read.
+    """
+    created = create(client)
+
+    assert created["value_precision"] is None
+    assert client.get("/api/streams").json()[0]["value_precision"] is None
+
+
+def test_put_sets_a_precision_and_it_reaches_the_config_file(client, data_dir):
+    """The operator's real path for turning rounding off on one stream, read back off disk."""
+    created = create(client)
+
+    response = client.put("/api/streams/{}".format(created["id"]), json={"value_precision": -1})
+    assert response.status_code == 200
+    assert response.json()["value_precision"] == -1
+
+    on_disk = load_streams()
+    assert on_disk[0].value_precision == -1
+    # Not sent in the PUT body, so it has to have been carried over rather than reset.
+    assert on_disk[0].influx_database == "metrics"
+
+
+def test_a_put_that_does_not_mention_the_precision_leaves_it_alone(client):
+    """Every other field is carried over on a partial PUT, and this one is not special.
+
+    Worth its own test because the carry-over reads `body.get(k, getattr(existing, k))`: a field
+    whose stored value is None is exactly the case where a `body.get(k)` written without the
+    fallback would look like it worked.
+    """
+    created = create(client, value_precision=8)
+
+    updated = client.put("/api/streams/{}".format(created["id"]), json={"name": "renamed"}).json()
+
+    assert updated["name"] == "renamed"
+    assert updated["value_precision"] == 8
+
+
+def test_put_can_clear_a_precision_back_to_the_default(client, data_dir):
+    """An explicit null is how the UI sends a cleared box, and it has to mean "unset" again."""
+    created = create(client, value_precision=-1)
+
+    path = "/api/streams/{}".format(created["id"])
+    updated = client.put(path, json={"value_precision": None}).json()
+
+    assert updated["value_precision"] is None
+    assert load_streams()[0].value_precision is None
+
+
+# ── value_precision: what the API refuses to store ────────────────────────────────────────────────
+#
+# `StreamConfig` is a plain dataclass and `StreamConfig(**body)` checks no types at all, so every
+# value below used to be answered with 200, written into streams.json and echoed back by GET and by
+# the UI — while the stream went on rounding to two decimals, because the only validation there was
+# lived in `resolve_value_precision()` and only ran when a processor was constructed, i.e. at the
+# next restart. That is the exact defect this whole setting exists to remove: the operator asked for
+# one precision and the database got another, with nothing anywhere saying so.
+
+REJECTED_PRECISIONS = [
+    "8",     # the number typed into what the operator took for a text field
+    "2",     # ... including the one that spells the current default, which looks harmless
+    2.0,     # what json.loads() makes of `2.0`; round(x, 2.0) is a TypeError
+    True,    # bool is a subclass of int — the case the isinstance() ordering exists for
+    False,
+    [],
+    {},
+]
+REJECTED_IDS = ["str-8", "str-2", "float", "true", "false", "list", "dict"]
+
+
+@pytest.mark.parametrize("bad", REJECTED_PRECISIONS, ids=REJECTED_IDS)
+def test_post_refuses_a_precision_that_is_not_an_integer(client, bad):
+    response = client.post("/api/streams", json=dict(STREAM_BODY, value_precision=bad))
+
+    assert response.status_code == 422, response.text
+    assert "value_precision" in response.json()["detail"]
+    # Refused BEFORE the write, not after it: nothing reached the file and nothing is listed.
+    assert load_streams() == []
+    assert client.get("/api/streams").json() == []
+
+
+@pytest.mark.parametrize("bad", REJECTED_PRECISIONS, ids=REJECTED_IDS)
+def test_put_refuses_a_precision_that_is_not_an_integer(client, manager_calls, bad):
+    """The path the bug was actually reported on: PUT answered 200 and stored the string."""
+    created = create(client, value_precision=8)
+    manager_calls.restarted.clear()
+
+    response = client.put("/api/streams/{}".format(created["id"]), json={"value_precision": bad})
+
+    assert response.status_code == 422, response.text
+    assert "value_precision" in response.json()["detail"]
+    # The stored stream is untouched — on disk and in what the API reports.
+    assert load_streams()[0].value_precision == 8
+    assert client.get("/api/streams").json()[0]["value_precision"] == 8
+    # And the running stream was not restarted for a request that was refused.
+    assert manager_calls.restarted == []
+
+
+@pytest.mark.parametrize("method", ["post", "put"])
+def test_a_precision_of_true_is_refused_and_not_read_as_one_decimal(client, method):
+    """The one bad value that would otherwise pass every plausible type check.
+
+    `bool` is a subclass of `int`, so `isinstance(True, int)` is True and `round(1.234, True)` is a
+    legal call that rounds to ONE decimal. Without the bool check placed before the int check,
+    `{"value_precision": true}` is not rejected and is not ignored either — it is silently accepted
+    as a precision of 1, which is the worst of the three outcomes: fewer decimals than the default
+    everyone else gets, on a stream nobody knows is configured that way.
+    """
+    if method == "post":
+        response = client.post("/api/streams", json=dict(STREAM_BODY, value_precision=True))
+        assert response.status_code == 422, response.text
+        assert load_streams() == []
+        stored = None
+    else:
+        created = create(client)
+        response = client.put("/api/streams/{}".format(created["id"]), json={"value_precision": True})
+        assert response.status_code == 422, response.text
+        stored = load_streams()[0].value_precision
+
+    # Nothing was stored, and what the rounding would resolve out of that is the historical default
+    # — two decimals, not the one decimal `True` would have bought.
+    assert stored is None
+    assert resolve_value_precision(stored) == DEFAULT_VALUE_PRECISION == 2
+
+
+@pytest.mark.parametrize("good", [8, 0, -1, None])
+def test_post_accepts_every_integer_precision_and_the_explicit_null(client, good, data_dir):
+    """The three configured states plus the null, each read back off disk rather than off the echo.
+
+    `0` is in the list on purpose: it is a legitimate precision (round to whole numbers) and it is
+    the value a validator written with a truthiness test would throw away.
+    """
+    created = create(client, value_precision=good)
+
+    assert created["value_precision"] == good
+    assert load_streams()[0].value_precision == good
+    assert client.get("/api/streams").json()[0]["value_precision"] == good
+
+
+def test_a_body_with_no_precision_key_at_all_is_accepted(client):
+    """The commonest body there is — the UI sends the key, a curl one-liner does not."""
+    body = {k: v for k, v in STREAM_BODY.items() if k != "value_precision"}
+    assert "value_precision" not in body
+
+    response = client.post("/api/streams", json=body)
+
+    assert response.status_code == 200, response.text
+    assert response.json()["value_precision"] is None
+    assert load_streams()[0].value_precision is None
 
 
 def test_delete_removes_the_stream(client):

@@ -46,9 +46,42 @@ a single JSON file:
 
 One record per stream: `id`, `name`, the MQTT side (`mqtt_host`, `mqtt_port`, `mqtt_user`,
 `mqtt_password`, `mqtt_topic`, `topic_prefix`), the InfluxDB side (`influx_host`, `influx_port`,
-`influx_user`, `influx_password`, `influx_database`) and `enabled`. It holds credentials in
-plaintext, so it belongs on the volume and nowhere else — never in the repository, never in an
-image.
+`influx_user`, `influx_password`, `influx_database`), `enabled` and the optional
+`value_precision`. It holds credentials in plaintext, so it belongs on the volume and nowhere else
+— never in the repository, never in an image.
+
+### `value_precision`
+
+How many decimals a stream's numbers are rounded to on the way in. Three states:
+
+| In `streams.json` | What happens |
+| --- | --- |
+| key absent, or `null` | **two decimals** — what this service has always done, and what every existing stream keeps doing |
+| a non-negative integer `N` | rounded to `N` decimals |
+| a negative integer (write `-1`) | **not rounded at all** — stored exactly as it arrived |
+
+It is per stream, and it is set in the UI ("Value Precision") or with a `PUT /api/streams/{id}`.
+The API takes an integer or `null` there and nothing else: `"8"`, `2.0`, `true` and the rest are
+answered with **422** instead of being stored, because a precision that is written to the file and
+then not applied to the data is the exact bug this setting exists to remove.
+
+Two decimals is fine for on/off states and room temperatures and destroys anything smaller: a
+calibration coefficient of `0.00003618` is stored as a flat `0.0` — stored, not dropped, so the
+series looks like a working sensor reading zero. Raising the number is not always the fix, because
+the right number depends on the magnitude of the value: `0.00003618` needs eight decimals, and the
+next device's coefficient may need more. For values like that use `-1` and store them as they came.
+
+An empty box in the UI and a missing key mean the same thing — the default. Turning rounding off
+is the state you have to type on purpose, so that clearing a field can never silently change what
+a production stream writes.
+
+**One caveat, and it is about rolling the image back.** `load_streams()` builds each record with
+`StreamConfig(**record)` under a blanket `except Exception: return []`, so a key an older build
+does not declare does not skip that record — it empties the entire config, and the next save writes
+that emptiness to disk. A stream that never sets `value_precision` never gets the key written (see
+`_serialize` in `src/config.py`), so it stays readable by an older image exactly as before. A
+stream that does set it makes the whole file unreadable to a build that predates the field. **If
+you ever roll back past this feature, delete the `value_precision` keys from `streams.json` first.**
 
 In production `/data` is a docker volume named `mqtt2influx_data`. **That volume is the entire
 configuration of the service**: lose it and every stream is gone. See the comment above the

@@ -12,7 +12,7 @@ from typing import Callable, Optional
 
 import aiomqtt
 
-from .influx_writer import contains_excluded, flatten_payload, InfluxWriter
+from .influx_writer import contains_excluded, flatten_payload, resolve_value_precision, InfluxWriter
 from .config import StreamConfig
 
 logger = logging.getLogger(__name__)
@@ -75,6 +75,13 @@ class StreamProcessor:
         self.on_event = on_event  # async callback(stream_id, event_type, data)
         self._task: Optional[asyncio.Task] = None
         self._running = False
+
+        # Resolved once, here, and not per message: the config value is validated and warned about
+        # in resolve_value_precision(), and doing that on every one of the tens of messages a second
+        # this stream sees would put the same warning in the log tens of times a second. A processor
+        # is rebuilt from scratch by manager.restart_stream() after every edit, so this stays in
+        # step with streams.json without being re-read.
+        self._value_precision = resolve_value_precision(cfg.value_precision, cfg.id)
 
         # The pending batch is shared between the message loop and the interval timer task, so every
         # read and write of it goes through the lock. Without it one task appends to the list while
@@ -357,7 +364,8 @@ class StreamProcessor:
 
                         points = [
                             (flat_topic, value, int(time.time() * 1000))
-                            for flat_topic, value in flatten_payload(full_topic, payload)
+                            for flat_topic, value in flatten_payload(
+                                full_topic, payload, self._value_precision)
                         ]
                         if not points:
                             continue
