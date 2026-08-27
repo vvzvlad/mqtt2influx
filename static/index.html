@@ -465,8 +465,13 @@ async function saveStream() {
   const influxHost = document.getElementById('fInfluxHost').value.trim();
   const influxDb = document.getElementById('fInfluxDb').value.trim();
   // An empty box means "not configured" and must travel as null, not as 0, so that a cleared field
-  // keeps meaning "the default two decimals".
-  // Number() and not parseInt(), and the pair with the Number.isInteger() check below is the whole
+  // keeps meaning "the default two decimals". `Number('')` is 0 and NOT NaN, so this branch is the
+  // only thing between an untouched box and a request that asks for whole numbers — which the API
+  // stores without a word of complaint. That is too much to hang on one expression, so the same raw
+  // string is tested again in the request body below: two independent checks, both landing on null,
+  // so losing either one costs the default two decimals rather than the fractional part of every
+  // value in the stream.
+  // Number() and not parseInt(), and the pair with the whole-number check below is the whole
   // point: `step="1"` and `min` are hints the browser applies to its own spinners and to
   // checkValidity(), which this function does not call, so `0.5` and `1e-5` can be TYPED into the
   // box and read straight back out of .value. parseInt() answers those two with 0 and with 1 —
@@ -479,7 +484,11 @@ async function saveStream() {
   if (!mqttHost) { alert('MQTT Host is required'); document.getElementById('fMqttHost').focus(); return; }
   if (!influxHost) { alert('InfluxDB Host is required'); document.getElementById('fInfluxHost').focus(); return; }
   if (!influxDb) { alert('InfluxDB Database is required'); document.getElementById('fInfluxDb').focus(); return; }
-  if (valuePrecision !== null && !Number.isInteger(valuePrecision)) {
+  // isSafeInteger and not isInteger: `Number.isInteger(1e21)` is true, but JSON.stringify writes
+  // that number as `1e+21` and Python's json.loads reads `1e+21` back as a FLOAT, so the API
+  // answers 422 for a value this guard has just called whole. Above 2^53 the two sides of the
+  // request do not mean the same thing by "integer"; below it they do.
+  if (valuePrecision !== null && !Number.isSafeInteger(valuePrecision)) {
     alert('Value Precision must be a whole number — leave it empty for the default 2, or -1 to store values as received');
     document.getElementById('fValuePrecision').focus();
     return;
@@ -498,15 +507,38 @@ async function saveStream() {
     influx_user: document.getElementById('fInfluxUser').value.trim(),
     influx_password: document.getElementById('fInfluxPass').value,
     influx_database: influxDb,
-    // No NaN guard here any more: the box is either empty (null) or holds a whole number the check
-    // above let through — anything else, NaN included, has already been refused with an alert.
-    value_precision: valuePrecision,
+    // The second of the two empty-box checks (see the read above), and the reason it tests
+    // `precisionRaw` rather than the number: `Number('')` is 0, so nothing downstream of the parse
+    // can tell an empty box from an operator who typed a zero. If the ternary up there is ever lost
+    // or rewritten, this is what still sends null instead of quietly rounding the whole stream to
+    // whole numbers. isFinite is the cheap catch-all for NaN and the infinities.
+    value_precision: precisionRaw === '' || !Number.isFinite(valuePrecision) ? null : valuePrecision,
     enabled: true,
   };
 
   const method = editingId ? 'PUT' : 'POST';
   const url = editingId ? `/api/streams/${editingId}` : '/api/streams';
-  await fetch(url, { method, headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
+  const res = await fetch(url, { method, headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
+  if (!res.ok) {
+    // The modal stays OPEN and nothing is reloaded. A refusal used to close the form and redraw the
+    // list exactly like a save that worked, which threw away every other edit made in the same
+    // window — a changed mqtt_host, say — with nothing on screen to say the stream was never
+    // written. 422 (a precision the API reads as a float), 404 (the stream was deleted in another
+    // tab) and 500 all came through that path.
+    let detail = '';
+    try {
+      const payload = await res.json();
+      // FastAPI puts the message in `detail`: a string for HTTPException, a list of field errors
+      // when the request model itself rejected the body.
+      if (payload && payload.detail !== undefined) {
+        detail = typeof payload.detail === 'string' ? payload.detail : JSON.stringify(payload.detail);
+      }
+    } catch (e) {
+      // A body that is not JSON — a proxy's error page — leaves the status to speak on its own.
+    }
+    alert(`Could not save the stream: HTTP ${res.status}${detail ? ` — ${detail}` : ''}`);
+    return;
+  }
   closeModal();
   await loadStreams();
   if (editingId) selectStream(editingId);
