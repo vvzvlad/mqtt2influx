@@ -61,6 +61,9 @@ How many decimals a stream's numbers are rounded to on the way in. Three states:
 | a negative integer (write `-1`) | **not rounded at all** — stored exactly as it arrived |
 
 It is per stream, and it is set in the UI ("Value Precision") or with a `PUT /api/streams/{id}`.
+The API takes an integer or `null` there and nothing else: `"8"`, `2.0`, `true` and the rest are
+answered with **422** instead of being stored, because a precision that is written to the file and
+then not applied to the data is the exact bug this setting exists to remove.
 
 Two decimals is fine for on/off states and room temperatures and destroys anything smaller: a
 calibration coefficient of `0.00003618` is stored as a flat `0.0` — stored, not dropped, so the
