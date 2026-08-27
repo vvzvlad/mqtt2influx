@@ -216,7 +216,7 @@
       </div>
       <div class="form-group full">
         <label>Value Precision — decimals (empty = 2, -1 = store as received)</label>
-        <input type="number" id="fValuePrecision" step="1" placeholder="2">
+        <input type="number" id="fValuePrecision" step="1" min="-1" placeholder="2">
       </div>
     </div>
     <div class="modal-footer">
@@ -464,15 +464,26 @@ async function saveStream() {
   const mqttHost = document.getElementById('fMqttHost').value.trim();
   const influxHost = document.getElementById('fInfluxHost').value.trim();
   const influxDb = document.getElementById('fInfluxDb').value.trim();
-  // An empty box means "not configured" and must travel as null, not as 0 — parseInt('') is NaN
-  // and JSON.stringify turns NaN into null anyway, but going through it deliberately keeps the
-  // "cleared field = the default two decimals" rule visible instead of accidental.
+  // An empty box means "not configured" and must travel as null, not as 0, so that a cleared field
+  // keeps meaning "the default two decimals".
+  // Number() and not parseInt(), and the pair with the Number.isInteger() check below is the whole
+  // point: `step="1"` and `min` are hints the browser applies to its own spinners and to
+  // checkValidity(), which this function does not call, so `0.5` and `1e-5` can be TYPED into the
+  // box and read straight back out of .value. parseInt() answers those two with 0 and with 1 —
+  // rounding to whole numbers, and to one decimal, on a stream whose operator asked for neither and
+  // saw the form save without a word. Number() keeps the value the operator actually entered, and
+  // the guard refuses it when it is not a whole number.
   const precisionRaw = document.getElementById('fValuePrecision').value.trim();
-  const valuePrecision = precisionRaw === '' ? null : parseInt(precisionRaw, 10);
+  const valuePrecision = precisionRaw === '' ? null : Number(precisionRaw);
 
   if (!mqttHost) { alert('MQTT Host is required'); document.getElementById('fMqttHost').focus(); return; }
   if (!influxHost) { alert('InfluxDB Host is required'); document.getElementById('fInfluxHost').focus(); return; }
   if (!influxDb) { alert('InfluxDB Database is required'); document.getElementById('fInfluxDb').focus(); return; }
+  if (valuePrecision !== null && !Number.isInteger(valuePrecision)) {
+    alert('Value Precision must be a whole number — leave it empty for the default 2, or -1 to store values as received');
+    document.getElementById('fValuePrecision').focus();
+    return;
+  }
 
   const body = {
     name: document.getElementById('fName').value.trim(),
@@ -487,7 +498,9 @@ async function saveStream() {
     influx_user: document.getElementById('fInfluxUser').value.trim(),
     influx_password: document.getElementById('fInfluxPass').value,
     influx_database: influxDb,
-    value_precision: Number.isNaN(valuePrecision) ? null : valuePrecision,
+    // No NaN guard here any more: the box is either empty (null) or holds a whole number the check
+    // above let through — anything else, NaN included, has already been refused with an alert.
+    value_precision: valuePrecision,
     enabled: true,
   };
 
