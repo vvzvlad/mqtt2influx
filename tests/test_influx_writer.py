@@ -25,6 +25,7 @@ from src.influx_writer import (
     EXCLUDED_SUBSTRINGS,
     InfluxWriter,
     RAW_VALUE_PRECISION,
+    _to_storable_float,
     contains_excluded,
     flatten_payload,
     make_line,
@@ -362,6 +363,43 @@ def test_an_integer_too_large_for_a_float_is_still_dropped_when_nothing_is_round
     """The OverflowError comes from `float()`, which runs before the rounding either way."""
     assert to_number(10 ** 400, None) is None
     assert to_number(10 ** 400, 8) is None
+
+
+def test_a_precision_that_makes_the_rounding_overflow_drops_the_value_instead_of_raising():
+    """`round()` raises OverflowError too, which is why the call sits inside the same try.
+
+    `round(1.7e308, -308)` is "rounded value too large to represent". No stream configured through
+    the UI can reach it — `resolve_value_precision()` maps every negative to None — but `precision`
+    is a public parameter of `_to_storable_float`, of `to_number` and of `flatten_payload`, and a
+    negative `ndigits` is a meaningful argument in Python, so the three functions are callable this
+    way by anything that skips the resolver.
+
+    Out of `flatten_payload` the exception has no handler until the outer `except Exception` in
+    `_process_forever`: one message would be counted as a stream error and cost a five-second
+    reconnect, during which the broker publishes to a subscriber that is not there and the points
+    are gone for good.
+    """
+    assert _to_storable_float(1.7e308, -308) is None
+    assert to_number(1.7e308, -308) is None
+    assert list(flatten_payload("ue/932c8c4aea2f", {"v": 1.7e308}, -308)) == []
+
+
+@pytest.mark.parametrize("value", [
+    float("nan"), float("inf"), float("-inf"),
+    "nan", "Infinity",
+    1e400,
+])
+@pytest.mark.parametrize("precision", [None, 0, 2, 8])
+def test_the_finite_check_still_runs_after_the_rounding_guard(value, precision):
+    """`math.isfinite` has to stay AFTER the try block, at every precision including no rounding.
+
+    Rounding leaves NaN and the infinities exactly as they were — `round(inf, 2)` is `inf`, it does
+    not raise — so nothing in the guard above catches them. If the check were folded into the try,
+    or skipped along with the rounding on the no-rounding path, `make_line` would render
+    `value=nan` and InfluxDB 1.x would reject the ENTIRE request body: the other 219 points batched
+    with it included, then a retry ladder against a 400 that never answers differently.
+    """
+    assert _to_storable_float(value, precision) is None
 
 
 def test_the_precision_reaches_every_leaf_of_a_nested_document():

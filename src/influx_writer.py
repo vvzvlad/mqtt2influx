@@ -96,16 +96,23 @@ def _to_storable_float(value, precision: Optional[int] = DEFAULT_VALUE_PRECISION
     """
     try:
         num = float(value)
-    except ValueError:
+        if precision is not None:
+            num = round(num, precision)
+    except (ValueError, OverflowError):
+        # ValueError is the ordinary case: a string that is not a number at all.
+        #
+        # OverflowError has two sources, and the rounding is INSIDE this guard because of the
+        # second one. float() raises it for an integer that does not fit a float, which json.loads()
+        # will happily parse at any length — and round() raises it too: `round(1.7e308, -308)` is
+        # "rounded value too large to represent". No stream can reach that through
+        # resolve_value_precision(), which maps every negative to None, but `precision` is a public
+        # parameter of this function, of to_number() and of flatten_payload(), and a negative
+        # ndigits is a meaningful argument in Python.
+        #
+        # Either way raising here would escape flatten_payload, escape the per-message block, be
+        # caught by the outer `except Exception` in _process_forever and cost a five-second
+        # reconnect — one device publishing a 400-digit number would throttle the whole stream.
         return None
-    except OverflowError:
-        # json.loads() parses an integer of any length; float() refuses one that does not fit.
-        # Raising here would escape flatten_payload, escape the per-message block, be caught by
-        # the outer `except Exception` in _process_forever and cost a five-second reconnect —
-        # one device publishing a 400-digit number would throttle the whole stream.
-        return None
-    if precision is not None:
-        num = round(num, precision)
     if not math.isfinite(num):
         # NaN and the infinities arrive by three routes that all look ordinary: json.loads("NaN")
         # and json.loads("Infinity") accept them by default, float("nan") parses the plain string
