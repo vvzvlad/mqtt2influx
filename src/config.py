@@ -8,7 +8,13 @@ import uuid
 from dataclasses import dataclass, field, asdict
 from typing import List, Optional
 
-DATA_DIR = os.environ.get("DATA_DIR", "/data")
+from .settings import settings
+
+# Read ONCE, at import, into a module-level name that `_config_path()` looks up on every call — so
+# rebinding this name redirects every read and write below, which is exactly what tests/conftest.py
+# does to keep the suite off the real directory. Keep it a module-level rebindable name rather than
+# reaching for `settings.data_dir` inline.
+DATA_DIR = settings.data_dir
 
 
 @dataclass

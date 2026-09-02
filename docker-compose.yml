@@ -1,15 +1,39 @@
-# Deploy template, kept in step with the Portainer stack that actually runs this service
-# (a standalone compose stack named `mqtt2influx`). Pull the prebuilt image from the Gitea
-# registry — do NOT build on prod.
+# EXAMPLE compose — an illustration of how this service is configured, NOT a copy of what runs.
+#
+# What it is for: showing which variables the service reads, which volumes and ports it needs,
+# and which labels matter. Copy it as a starting point for a deployment. That is the whole job.
+#
+# It is NOT kept in sync with the running deployment and MUST NOT BE. Wherever this service
+# actually runs — in this fleet, a Portainer stack — THAT deployment is the only source of truth
+# for what it does: its variables, its volume paths, its domain, its image tag. This file cannot
+# answer any of those questions, and it is not trying to. A difference between the two is
+# therefore NOT a defect and NOT something to reconcile: there is nothing here to bring into
+# agreement. Do not "fix" this file against a running deployment, and do not change a deployment
+# to match this file.
+#
+# NOTHING REAL GOES IN HERE. Not a password, not a token, not a key, not a host. Every value below
+# is a PLACEHOLDER: `XXX` for a secret, `example.com` or `example.lc` for a name, a documentation
+# address (RFC 5737 — 192.0.2.0/24, 198.51.100.0/24, 203.0.113.0/24) for an IP. That holds INSIDE
+# COMMENTS TOO, and it holds for a value that is only a default rather than a credential. Never
+# write a real one here, and never "correct" a placeholder to the value some deployment happens to
+# use. Naming a real host is precisely what makes the next reader believe this file describes
+# production — the mistake this header exists to prevent, and one that keeps being made. Several
+# of these repositories are public and mirrored: a secret committed here is a secret published.
+#
+# ONE deliberate exception: the registry host, wherever it appears — in the image path or in a
+# comment. It is real, because without it there is nothing to pull.
+#
+# Deploy from a prebuilt image — a `build:` here, where present, is for running locally.
 #
 # NAMING: the repository, this directory, the service, the container, the Portainer stack and the
 # image all use the same name, mqtt2influx. That is not cosmetic here — see the volume note below.
 #
 # WHAT THIS SERVICE IS: a bridge that subscribes to MQTT, flattens whatever arrives into InfluxDB
 # line protocol and writes it in batches, plus a small web UI to configure and watch the streams.
-# It has moved 612 million messages and written 604 million points on this host. MQTT does not
-# buffer for a subscriber that is not connected, so every second the container is down is points
-# that are gone for good rather than points that arrive late. Redeploy accordingly.
+# Its workload is continuous and high-rate, and MQTT does not buffer for a subscriber that is not
+# connected: every second the container is down is points that are gone for good rather than points
+# that arrive late. Downtime here is DATA LOSS, not lag — that is the property to size a redeploy
+# around, whatever the deployment.
 
 # The stack joins an EXISTING network rather than creating its own. `external: true` means compose
 # will not create it and will fail loudly if it is missing, which is the right failure: silently
@@ -22,17 +46,30 @@ networks:
 # THE VOLUME NAME IS LOAD-BEARING AND THE ARITHMETIC BELOW IS THE WHOLE REASON THIS COMMENT EXISTS.
 #
 # All of this service's configuration — every stream, with its MQTT and InfluxDB hosts, credentials,
-# topic filters and prefixes — lives in ONE file, /data/streams.json, on this volume. There is no
-# database and no environment-variable fallback: an empty volume is a bridge that writes nothing and
-# a UI that shows an empty list.
+# topic filters and prefixes — lives in ONE file, streams.json, on this volume. There is no database
+# and no environment-variable fallback: an empty volume is a bridge that writes nothing and a UI
+# that shows an empty list.
 #
 # The key here is `data`, NOT `mqtt2influx_data`. Compose prefixes a non-external volume key with the
 # project name, and Portainer uses the STACK name as the project name: `mqtt2influx` + `_` + `data`
-# = `mqtt2influx_data`, which is exactly the volume that exists on the production host today
-# (verified: its labels read com.docker.compose.project=mqtt2influx, com.docker.compose.volume=data,
-# and the running container has it mounted at /data). Writing `mqtt2influx_data` as the key would ask
-# for `mqtt2influx_mqtt2influx_data` — a brand-new, EMPTY volume — and the redeploy would come up
-# looking healthy with every stream gone.
+# = `mqtt2influx_data`, so the key `data` is what asks for that volume. Writing `mqtt2influx_data`
+# as the key would ask instead for `mqtt2influx_mqtt2influx_data` — a brand-new, EMPTY volume — and
+# the redeploy would come up looking healthy with every stream gone. Which volume any given
+# deployment actually carries is a question for that deployment, never for this file.
+#
+# CHANGING THE MOUNT POINT — say from `/data` to `/app/data` — IS A REMOUNT, NOT A MIGRATION.
+# It is the SAME named volume (`mqtt2influx_data`) with the same bytes in it, appearing at a
+# different path inside the container. Nothing is copied, nothing is converted, and there is
+# nothing to back up beyond the usual: the only thing that changes is where the container looks.
+#
+# What DOES have to happen atomically is the pair below — the `DATA_DIR` line in `environment:` and
+# the `- data:/app/data` line in `volumes:`. They are two halves of one fact and a deploy that moves
+# one without the other is silent data loss, in either direction:
+#   * bind moved, DATA_DIR left behind -> the app writes to the old path, which is now an unmounted
+#     directory in the container's writable layer. It comes up healthy, shows an empty stream list,
+#     and the next image update deletes whatever was saved into it.
+#   * DATA_DIR moved, bind left behind -> exactly the same, at the other path.
+# So change both in ONE StackUpdate. Never edit the mount and the variable in two passes.
 #
 # The corollary: renaming the Portainer stack detaches the data just as effectively. If that is ever
 # needed, pin the volume first — `external: true` plus `name: mqtt2influx_data`.
@@ -75,8 +112,8 @@ services:
     # InfluxDB. It costs nothing on a healthy stop either — the process exits as soon as it is done
     # and docker does not wait out the remainder.
     stop_grace_period: 30s
-    # The container STARTS as root — /entrypoint.sh needs it to chown this volume, which production
-    # wrote back when the image still ran as root — and immediately drops to uid 1000 with gosu.
+    # The container STARTS as root — /entrypoint.sh needs it to chown this volume, whose contents an
+    # earlier root-running image left owned by root — and immediately drops to uid 1000 with gosu.
     # `no-new-privileges` blocks only the setuid/setgid path back UP, so it costs that drop nothing;
     # what it stops is the app process regaining root through some setuid binary a future base-image
     # bump happens to ship. Do NOT add a `user:` override here: it would take root away before the
@@ -95,9 +132,9 @@ services:
     environment:
       # Read once at import time by src/mqtt_processor.py, so a change here needs a container
       # restart, not just a reload. They bound the write batch: flush after BATCH_SIZE points or
-      # after BATCH_INTERVAL seconds, whichever comes first. 220/3 are the values this deployment
-      # has been running on — larger batches than the 100/1.0 defaults baked into the Dockerfile,
-      # which is what keeps the InfluxDB write rate reasonable at this message volume.
+      # after BATCH_INTERVAL seconds, whichever comes first. The values below are deliberately
+      # larger than the 100/1.0 defaults baked into the Dockerfile: bigger batches are what keep the
+      # InfluxDB write rate reasonable once the message rate is high. Size them per deployment.
       BATCH_SIZE: 220
       BATCH_INTERVAL: 3
       # Fleet convention, and cheap insurance rather than a fix for anything visible today: nothing
@@ -107,8 +144,17 @@ services:
       # TZ writes it in UTC while the operator reading it is three hours ahead — and that gets
       # discovered mid-incident, which is the worst moment to discover it.
       TZ: Europe/Moscow
+      # Set EXPLICITLY here even though the image already defaults to this exact path, and that is
+      # deliberate belt-and-braces rather than duplication. A stack carrying the label below is
+      # auto-updated: a new image can arrive and recreate the container with nobody editing this
+      # file, so the mount point it uses must not be something a future image is free to change
+      # underneath it. Written here, the pair of lines is self-consistent whatever the image
+      # defaults to. Read once at import — a change needs a restart, not a reload.
+      DATA_DIR: /app/data
     volumes:
-      - data:/data
+      # Must stay in step with DATA_DIR above; see the block above the `volumes:` key at the top of
+      # this file for why the two move together or not at all.
+      - data:/app/data
     logging:
       # Without this a json-file log grows without bound until the host's disk is full — which on a
       # service logging every flush is not a theoretical horizon. 5 x 10m caps it at 50 MB.
@@ -117,9 +163,12 @@ services:
         max-file: 5
         max-size: 10m
     labels:
-      # This host's image updater watches THIS label (not watchtower's). It is what makes a push of
-      # :latest by .gitea/workflows/image-check-publish.yml roll out on its own — and therefore what
-      # makes the smoke gate in that workflow the last place a broken image can still be stopped.
+      # The image updater in our Portainer build watches THIS label — the key the fleet uses.
+      # The `com.centurylinklabs.watchtower.*` family is legacy and is being migrated away — do
+      # not add one back. Where
+      # that updater is running, it is what makes a push of :latest by
+      # .gitea/workflows/image-check-publish.yml roll out on its own — and therefore what makes the
+      # smoke gate in that workflow the last place a broken image can still be stopped.
       io.portainer.update.enable: "true"
     healthcheck:
       # There is NO curl in the image (python:3.11-slim ships without it, and nothing installs it),

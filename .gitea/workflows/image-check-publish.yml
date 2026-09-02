@@ -57,26 +57,27 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
-  build:
+  test:
     # `ubuntu-latest` is a LABEL, not a machine: the instance-level runner registered in Gitea
     # advertises it and serves every repository on the instance. Writing the runner's own name here
     # would leave the job queued forever, because no runner offers a label by that name.
     runs-on: ubuntu-latest
-    # The four step-level timeouts below come to 70 minutes (15 tests + 20 build + 20 smoke + 15
-    # push); 85 leaves 15 on top for checkout, the tag computation, the registry login, the two
-    # cleanup steps and the logout. The outer bound has to EXCEED the sum, not equal it: act_runner
-    # kills the whole job when this fires, and a step marked `if: always()` is not guaranteed to run
-    # afterwards — so a job that dies mid-push leaves the smoke containers and a few hundred MB of
-    # image sitting on the daemon the entire fleet shares.
-    timeout-minutes: 85
-    # Job-level, so the test step, the smoke step and the cleanup step cannot disagree about it. They
-    # are the ends of the same mechanism — ci/smoke.py names its container after this, the test step
-    # names another, the cleanup step removes both by the same names — and written as separate
-    # literals they would go on looking correct while one of them was edited, turning the cleanup
-    # into a step that removes nothing and reports success.
-    # The run id is what keeps concurrent runs on this shared daemon from colliding, and ci/smoke.py
-    # refuses to start without this variable rather than falling back to a constant, which would
-    # reintroduce exactly that collision.
+    # 25 against the single 15-minute step below, leaving room for the checkout and the cleanup that
+    # follows it. The outer bound has to EXCEED the sum, not equal it: act_runner kills the whole job
+    # when this fires, and a step marked `if: always()` is not guaranteed to run afterwards — so a
+    # job that dies inside the suite leaves its container on the daemon the entire fleet shares.
+    timeout-minutes: 25
+    # Job-level, so the step that CREATES the test container and the step that REMOVES it cannot
+    # disagree about its name. Written as two literals in two steps they would go on looking correct
+    # while one of them was edited, turning the cleanup into a step that removes nothing and reports
+    # success.
+    # The same expression appears again in the `build` job below, and the duplication is forced: a
+    # Gitea Actions job inherits nothing from its neighbour, and the two jobs run on separate runner
+    # instances with separate workspaces. It is harmless because the two names address DISJOINT
+    # containers — `-tests` is created and removed here, `-serve` is created and removed there — so
+    # a drift between the copies costs readability on `docker ps` and nothing else.
+    # The run id is what keeps concurrent runs on this shared daemon from colliding — including this
+    # publishing run and the PR check of the same commit.
     env:
       SMOKE_NAME: mqtt2influx-smoke-${{ github.run_id }}
     steps:
@@ -89,8 +90,9 @@ jobs:
         # cheaper approximation.
         fetch-depth: 0
     - name: Run the test suite
-      # FIRST, before anything is built: a red suite must not spend twenty minutes building an image
-      # nobody is going to push.
+      # In a JOB of its own, which the `build` job below depends on: a red suite must not spend
+      # twenty minutes building an image nobody is going to push, and expressed as a dependency that
+      # is a property of the pipeline rather than of which step happens to be written first.
       #
       # `actions/setup-python` is deliberately NOT used, and that is a change from the GHCR workflow
       # this replaces. Setup actions are not verified on this self-hosted runner, and the failure
@@ -117,9 +119,10 @@ jobs:
         set -e
         set -o pipefail
         # A re-run from the UI reuses the run id, hence this name; a previous attempt killed by the
-        # step timeout may have left the container behind. A no-op when it did not. `-v` because
-        # this image declares VOLUME ["/data"], so every run of it creates an anonymous volume that
-        # would otherwise accumulate on a daemon the whole fleet shares.
+        # step timeout may have left the container behind. A no-op when it did not. `-v` removes any
+        # ANONYMOUS volume the container owns — this one is python:3.11-slim and owns none, and the
+        # project's image no longer declares a VOLUME either; the flag is insurance so that one
+        # leaked volume per run cannot accumulate on a daemon the whole fleet shares.
         docker rm -f -v "$SMOKE_NAME-tests" || true
         # --exclude paths that are large, useless in the container, or actively harmful: .git is the
         # history this job deliberately fetched, .venv is a host-built tree of macOS wheels for a
@@ -127,7 +130,11 @@ jobs:
         # state that does not exist on the runner but does on a workstation — where this same
         # command, run by hand to reproduce a CI failure, would otherwise ship a developer's real
         # streams.json, broker passwords and all, into the container — .roo is editor scratch, and
-        # __pycache__ is bytecode compiled by a different interpreter.
+        # __pycache__ is bytecode compiled by a different interpreter. .env is excluded for the same
+        # reason as data/: it does not exist on the runner, but `make env` creates one on a
+        # workstation, and src/settings.py now READS it — so a hand-run of this command would ship a
+        # developer's DATA_DIR and batching values into the container and have the suite grade them
+        # instead of the defaults.
         # --pull always for the same reason `docker build --pull` carries it below: this runner is
         # self-hosted with a persistent daemon, so a once-pulled python:3.11-slim would serve every
         # run for months. Here that image is the interpreter the whole suite runs on, which makes it
@@ -135,7 +142,7 @@ jobs:
         # No `-e` flags: this service has no required environment variables at all. Every stream it
         # knows about lives in a JSON file under DATA_DIR, and the suite redirects DATA_DIR to a
         # tmp_path per test, so there is nothing to inject here.
-        tar --exclude=./.git --exclude=./.venv --exclude=./data --exclude=./.roo --exclude=__pycache__ -cf - . \
+        tar --exclude=./.git --exclude=./.venv --exclude=./data --exclude=./.env --exclude=./.roo --exclude=__pycache__ -cf - . \
           | docker run --rm -i --pull always --name "$SMOKE_NAME-tests" -w /w \
               python:3.11-slim bash -c '
           set -e
@@ -148,6 +155,55 @@ jobs:
           # collected half of itself produces a log indistinguishable from a healthy one.
           pytest --tb=short
         '
+    - name: Remove the test container from the runner
+      # `always()` because the run this step exists for is precisely the one that failed or was
+      # killed. On a normal run `--rm` on the `docker run` above has already disposed of the
+      # container and this does nothing; on the run where the step hit its 15-minute bound the docker
+      # CLIENT died here on the runner while the container went on running on a daemon shared by
+      # every repository — `--rm` is removal-on-exit performed by the daemon and never fires for a
+      # container that never exits, so the leftover has to be removed by the name it was given for
+      # exactly this purpose.
+      # `-v` removes a container's ANONYMOUS volumes. This container is python:3.11-slim rather than
+      # the project's image, and the project's image no longer declares a VOLUME either, so there is
+      # nothing to remove today — the flag is here so that both removal paths for a named container
+      # in these workflows carry it, and it can never reach a NAMED volume, only that one
+      # container's anonymous ones.
+      # Best-effort: `|| true` so a container that is already gone cannot turn a green suite into a
+      # red job and bury the one verdict this run is read for.
+      # The body below is byte-identical to the one in tests.yml.
+      if: always()
+      run: |
+        docker rm -f -v "$SMOKE_NAME-tests" || true
+
+  build:
+    # `needs: test` is what makes "a red suite never reaches the registry" a property of the
+    # PIPELINE rather than of step ordering inside one job. Everything below — the build, the gate,
+    # the login, the push — is unreachable until the suite above is green, and the same dependency
+    # exists in tests.yml so that the PR check rehearses this shape and not merely these steps.
+    needs: test
+    runs-on: ubuntu-latest
+    # The three step-level timeouts below come to 75 minutes (20 build + 40 smoke + 15 push); 90
+    # leaves 15 on top for the checkout, the tag computation, the registry login, the two cleanup
+    # steps and the logout. The outer bound has to EXCEED the sum, not equal it: act_runner kills the
+    # whole job when this fires, and a step marked `if: always()` is not guaranteed to run afterwards
+    # — so a job that dies mid-push leaves the smoke containers, a few hundred MB of image AND a live
+    # registry credential sitting on the daemon the entire fleet shares.
+    timeout-minutes: 90
+    # Job-level, so the smoke step and the cleanup step cannot disagree about it: ci/smoke.py names
+    # its container after this and the cleanup removes it by the same name, and as separate literals
+    # they would go on looking correct while one of them was edited, turning the cleanup into a step
+    # that removes nothing and reports success. ci/smoke.py refuses to start without this variable
+    # rather than falling back to a constant, which would reintroduce exactly the collision the run
+    # id is here to prevent. See the note in the `test` job above about the duplicated expression.
+    env:
+      SMOKE_NAME: mqtt2influx-smoke-${{ github.run_id }}
+    steps:
+    - uses: actions/checkout@v7
+      with:
+        # A job of its own gets a workspace of its own, so this checkout is not a repetition of the
+        # one in `test` — without it there would be no Dockerfile to build and no ci/smoke.py to run.
+        # `fetch-depth: 0` for the same reason as there, and identically to tests.yml.
+        fetch-depth: 0
     - name: Compute image tags
       id: tags
       # main -> :latest + :<sha> (production follows :latest); ANY other branch -> :<branch>.
@@ -249,7 +305,7 @@ jobs:
       #
       # It is also the only thing in this pipeline that looks at the ARTEFACT. The test step above
       # proves the SOURCE is good; it says nothing about whether pip resolved a dependency set that
-      # actually imports, whether static/ reached the image, whether /data is writable by the user
+      # actually imports, whether static/ reached the image, whether /app/data is writable by the user
       # the image runs as, or whether .dockerignore still keeps a developer's real streams.json out.
       #
       # READ THE MODULE DOCSTRING IN ci/smoke.py BEFORE CHANGING THE CHECKS. Three things there are
@@ -266,13 +322,15 @@ jobs:
       # python3. Inside the container it is the other way round — the image's own interpreter is
       # `python` — and ci/smoke.py invokes it accordingly.
       #
-      # 20 minutes, set against ci/smoke.py's own worst case of roughly 15 if every docker call it
-      # makes runs out its bound. In practice the whole gate is well under a minute — the worst case
-      # grew when the gate gained the volume-repair restart and the SIGTERM shutdown, both of which
-      # wait on the container rather than on the daemon. Being killed BY this timeout is what the
-      # margin is for: the script's own container cleanup would not run, and the `if: always()` step
-      # below catches that.
-      timeout-minutes: 20
+      # 40 minutes, set against ci/smoke.py's own worst case of 33 minutes if every docker call it
+      # makes runs out its bound — seven minutes of headroom. That sum is derived call by call in
+      # the `bounds` block of ci/smoke.py, the cleanup removals included. In practice the whole gate
+      # is well under a minute; the worst case grew when the gate gained the volume-repair restart,
+      # the SIGTERM shutdown, the legacy-layout container and then the empty-legacy-volume one, all
+      # of which wait on a container rather than on the daemon. Being killed BY this timeout is what
+      # the margin is for: the script's own container and volume cleanup would not run, and the
+      # `if: always()` step below catches that.
+      timeout-minutes: 40
       env:
         SMOKE_IMAGE: ${{ steps.tags.outputs.smoke }}
       # The body of this step is byte-identical to the one in tests.yml. Only the `env:` value above
@@ -333,23 +391,47 @@ jobs:
       # ci/smoke.py removes its own container itself — before it starts it, and again in a `finally`
       # — so on a normal run this is a no-op. It exists for the run where a step was killed by its
       # own timeout and never reached any of that.
-      # BOTH names are removed, not just the long-lived one: `--rm` disposes of a container that
-      # EXITED, and the case this step is for is the container that did not. When a bound fires
-      # inside ci/smoke.py it kills the docker client on the runner, not the container on the daemon,
-      # so a hung `--rm` run survives it and has to be removed here, by the name it was given for
-      # exactly this purpose.
-      # $SMOKE_NAME comes from the job-level `env:` — the same value the test and smoke steps used,
-      # not a second copy of the expression that could drift from it.
+      # The name is removed even though ci/smoke.py's own container carries `--rm`: that is
+      # removal-on-exit performed by the daemon, and the case this step is for is the container that
+      # did NOT exit. When a bound fires inside ci/smoke.py it kills the docker client on the runner,
+      # not the container on the daemon, so a hung `--rm` run survives it and has to be removed here,
+      # by the name it was given for exactly this purpose.
+      # $SMOKE_NAME comes from the job-level `env:` — the same value the smoke step used, not a
+      # second copy of the expression that could drift from it.
       if: always()
       run: |
-        # -tests is the test-suite container; -serve is the container the gate boots with the image's
-        # real command. Kept in step with ALL_SUFFIXES in ci/smoke.py and with the test step above.
-        # `-v` is not boilerplate here: the Dockerfile declares VOLUME ["/data"], so every run of
-        # this image creates an ANONYMOUS volume, and removing the container without it leaves one
-        # behind per run, forever, on a daemon the whole fleet shares.
+        # -serve is the container the gate boots with the image's real command; -legacy is the second
+        # one it boots in the shape the older deployments have — the volume at /data and no
+        # DATA_DIR — and -legacy-empty is the third, that same shape on a volume that holds no
+        # streams.json yet, which is the case the seeded one cannot test.
+        # -legacy-seed and -legacy-empty-readback are the two SHORT-LIVED helpers those checks run
+        # against their volumes: one writes the fixture onto the seeded volume, the other reads the
+        # empty one back. Both carry `--rm` and are listed here anyway, for the same reason the
+        # long-lived ones are — `--rm` is removal-on-exit performed by the daemon, and the run this
+        # step exists for is the one whose client was killed by a step timeout and whose container
+        # therefore never exited. The read-back one holds a named volume open while it sits there, so
+        # it would take the `docker volume rm` below down with it.
+        # Kept in step with ALL_SUFFIXES in ci/smoke.py. The test-suite container is
+        # `-tests` and is deliberately NOT in this loop any more: it belongs to the `test` job, which
+        # creates it and removes it in a cleanup step of its own. This job could not remove it in any
+        # case — the two jobs are scheduled independently and need not land on the same runner or the
+        # same daemon.
+        # `-v` removes a container's ANONYMOUS volumes. The image no longer declares a VOLUME, so
+        # there are none today; the flag stays as insurance for the day one comes back, because a
+        # volume leaked per run accumulates forever on a daemon the whole fleet shares.
         # No `set -eu` here on purpose: this is best-effort cleanup, every removal already ends in
         # `|| true`, and failing the step would turn a leftover container into a red job.
-        for suffix in -tests -serve; do docker rm -f -v "$SMOKE_NAME$suffix" || true; done
+        for suffix in -serve -legacy -legacy-empty -legacy-seed -legacy-empty-readback; do
+          docker rm -f -v "$SMOKE_NAME$suffix" || true
+        done
+        # The two NAMED volumes the gate creates for the legacy-layout checks: one seeded with a
+        # streams.json, one deliberately left EMPTY. `docker rm -v` never removes a named volume — by
+        # design, since somebody else may still want it — so they have to go by name, and only AFTER
+        # the containers that mounted them, or the daemon refuses. Kept in step with
+        # LEGACY_VOLUME_SUFFIX and EMPTY_LEGACY_VOLUME_SUFFIX in ci/smoke.py.
+        for suffix in -legacy-data -legacy-empty-data; do
+          docker volume rm "$SMOKE_NAME$suffix" || true
+        done
     - name: Remove the built images from the runner
       # The runner's docker daemon is persistent, so the images built here would otherwise pile up
       # and grow the disk forever. This step removes ONLY the tags this run created — no

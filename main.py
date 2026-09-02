@@ -8,9 +8,10 @@
 # pylint: disable=f-string-without-interpolation, global-statement
 
 import argparse
-import os
 
 import uvicorn
+
+from src.settings import settings
 
 def main():
     # The description said "Label Maker Server" until now — a leftover from the project this file
@@ -19,7 +20,11 @@ def main():
         description="mqtt2influx — MQTT to InfluxDB bridge with a web UI")
     parser.add_argument("--host", default="0.0.0.0", help="Host to bind the server to")
 
-    default_port = int(os.getenv("PORT", "8000"))
+    # The DEFAULT of --port, not an override of it: argparse only reaches for `default` when the
+    # flag is absent, so `python main.py --port 9000` still wins over PORT in the environment. That
+    # order is the documented one (.env.example, README) — do not invert it by reading the setting
+    # after args have been parsed.
+    default_port = settings.port
     parser.add_argument("--port", type=int, default=default_port,
                         help=f"Port to bind the server to (default: {default_port}, can be set via PORT env var)")
     parser.add_argument("--reload", action="store_true", help="Enable auto-reload for development")

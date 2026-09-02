@@ -26,7 +26,7 @@ The three INNER halves are PROBES: programs that live here as string constants a
 dependencies inside the image. The SERVICE probe answers whether the running process is really
 serving — the whole REST surface, the config file it writes to the volume, the static UI and the
 websocket. The REPAIR probe runs once more at the end, against a container that has been restarted
-on a /data deliberately handed back to root, and asks whether the entrypoint put it right again.
+on an /app/data deliberately handed back to root, and asks whether the entrypoint put it right again.
 
 They run inside for two reasons. The obvious one is that those objects only exist in there. The
 other shapes this whole file: **this job and the docker daemon are not in the same network
@@ -37,18 +37,21 @@ it provides drives a daemon outside it. So:
   namespace, and this job's 127.0.0.1 is a different loopback entirely — the gate would be talking
   to its own empty socket and would have to be written as "connection refused, so probably fine",
   which is the kind of check that passes forever after the service stops working.
-* NOTHING IS BIND-MOUNTED either. A `-v $(pwd):/w` would hand the daemon a path that exists in this
-  container's filesystem and not in its own; it would mount an empty directory, and every file check
-  would pass by looking at nothing.
+* NO HOST PATH IS BIND-MOUNTED either. A `-v $(pwd):/w` would hand the daemon a path that exists in
+  this container's filesystem and not in its own; it would mount an empty directory, and every file
+  check would pass by looking at nothing. NAMED volumes are a different thing entirely — they live
+  on the daemon's side and mean the same to both — which is why check_legacy_layout() and
+  check_empty_legacy_layout() below are allowed to create one each, seed the first through a
+  throwaway container, and mount both.
 
 Everything internal therefore goes through `docker exec`, which puts the probe in the container's
 own namespace — where 127.0.0.1 means what the compose healthcheck means by it.
 
 Two more properties of `docker exec` are worth stating because checks below depend on them: it does
 NOT go through ENTRYPOINT, and it runs as the image's `Config.User`. Both cut the same way here. The
-image declares `/entrypoint.sh` — which starts as root, repairs the ownership of /data and `exec`s
+image declares `/entrypoint.sh` — which starts as root, repairs the ownership of /app/data and `exec`s
 gosu to drop to uid 1000 — and declares no `USER`, so every probe below arrives as ROOT and bypasses
-that drop entirely. Half of that is convenient: a root probe can read /proc/1/status and stat /data
+that drop entirely. Half of that is convenient: a root probe can read /proc/1/status and stat /app/data
 whatever their ownership. The other half is a trap, and it is the one that matters — a probe that
 asked for its OWN uid would answer 0 forever and prove nothing about the process that serves. So the
 non-root check interrogates PID 1, the only process in the container that came through the
@@ -56,16 +59,16 @@ entrypoint, and the contract check pins the ENTRYPOINT to an exact value rather 
 a process that never went through one.
 
 The repair probe is the one exception and passes `-u 1000:1000` for exactly that reason: its question
-is whether the SERVING uid can write to /data, and root would answer yes to it on every image forever.
+is whether the SERVING uid can write to /app/data, and root would answer yes to it on every image forever.
 Both cuts are used deliberately — the same `docker exec`-arrives-as-root property is what lets this
-gate stage a root-owned /data in the first place, which is a thing no process inside the container
+gate stage a root-owned /app/data in the first place, which is a thing no process inside the container
 can do to itself once the entrypoint has dropped privileges.
 
 WHY THE CRUD CYCLE IS THE CENTRE OF THIS FILE
 ---------------------------------------------
 tests/ already proves the SOURCE is good. It says nothing about the artefact: whether pip resolved a
 dependency set that actually imports, whether .dockerignore still keeps the developer's data/ out,
-whether static/ was copied at all, whether the volume at /data is writable by the user the image
+whether static/ was copied at all, whether the volume at /app/data is writable by the user the image
 runs as. So the gate drives the real image through the whole lifecycle a user drives it through —
 create a stream, see it listed, edit it, delete it — and then reads the file that lifecycle was
 supposed to produce OFF THE CONTAINER'S DISK rather than believing the API's own echo. The API
@@ -80,11 +83,12 @@ image's fault.
 
 THE CHECKS
 ----------
-* (a) the image's declared contract: CMD, WORKDIR, ENTRYPOINT, DATA_DIR=/data. Outer half.
+* (a) the image's declared contract: CMD, WORKDIR, ENTRYPOINT, and the deliberate ABSENCE of a
+      DATA_DIR in its environment. Outer half.
 * (b) the real command starts and uvicorn reports itself listening on 8000. Outer half.
 * (c) the empty state: GET /api/streams answers 200 with [] on a fresh volume. Service probe.
 * (d) the full CRUD cycle over HTTP, including the second DELETE that must be a 404. Service probe.
-* (e) persistence: /data/streams.json exists on the container's disk and holds the created stream.
+* (e) persistence: /app/data/streams.json exists on the container's disk and holds the created stream.
       Read with open(), not asked of the API. Service probe.
 * (f) GET /api/stats answers 200 with valid JSON — it is also the compose healthcheck's target, and
       Portainer's updater rolls the image back if it does not go healthy within 120 s. Service probe.
@@ -102,24 +106,69 @@ THE CHECKS
 * (l) PID 1 — the process the ENTRYPOINT actually started — runs as uid 1000 and not as root. This
       is the artefact, not the intention: a Dockerfile can carry every non-root instruction there is
       and still serve as root if the entrypoint stopped `exec`ing gosu. Service probe.
-* (m) /data is writable by the uid PID 1 really runs as. The privilege drop and the volume's
+* (m) /app/data is writable by the uid PID 1 really runs as. The privilege drop and the volume's
       ownership are set in two different places — a chown at build time and a chown at start — and
       an image that dropped privileges but left the volume owned by root comes up perfectly, serves
       every read, and fails the first time somebody saves a stream. Service probe.
-* (n) the entrypoint really REPAIRS a /data it did not create. On its own (m) cannot fail: the
-      container below runs with no `-v`, so /data is the anonymous volume docker seeds from the
-      image — and seeding copies the Dockerfile's `chown app:app /data` with it, which makes the
-      volume arrive owned by uid 1000 whether the entrypoint chowns anything or not. The case that
-      is left uncovered is the only one the entrypoint's chown was ever written for: production's
-      volume, created by the older ROOT-based image and never re-seeded, because docker seeds a
-      volume only while it is empty. So this check stages it — hand /data back to root:root through
-      `docker exec`, restart the container, ask (l) and (m) again of a volume docker did NOT seed.
-      Outer half + repair probe.
+* (n) the entrypoint really REPAIRS an /app/data it did not create. On its own (m) cannot fail: the
+      container below runs with no `-v` and the image declares no VOLUME, so /app/data is simply the
+      directory the IMAGE LAYER carries — created and `chown app:app`ed by the Dockerfile at build
+      time — read and written through the container's writable layer, which `docker restart`
+      preserves. It therefore arrives owned by uid 1000 whether the entrypoint chowns anything or
+      not, and stays that way across the restart below. The case that is left uncovered is the only
+      one the entrypoint's chown was ever written for: production's NAMED volume, created by the
+      older ROOT-based image, which docker never re-seeds from the image because it seeds a volume
+      only while it is empty — so it keeps root's ownership forever. So this check stages that
+      state — hand /app/data back to root:root through `docker exec`, restart the container, ask (l)
+      and (m) again of a directory nothing put right for us. Outer half + repair probe.
 * (o) SIGTERM reaches PID 1 and it exits 0, rather than sitting there until the grace period runs
       out and the kernel kills it. The whole gosu-and-not-su paragraph in the Dockerfile is about
       this one property, and (l) catches only its crudest loss: under `su` PID 1 would run as uid 0,
       but a `sh -c "python main.py"` wrapper keeps the uid and drops the signal all the same. Runs
-      LAST of everything that touches the container, because it ENDS it. Outer half.
+      LAST of everything that touches the -serve container, because it ENDS it. Outer half.
+* (p) THE LEGACY LAYOUT, in a SECOND container shaped the way the older deployments really are: a
+      named volume already holding a streams.json mounted at /data, and NO DATA_DIR in the
+      environment. Everything above runs in the consistent layout — no environment overrides, no
+      mount at all — so no check above this one can even reach the combination that costs the most.
+      This one asserts that the entrypoint says in the log which path it fell back to and why, that
+      the service SERVES the streams the volume really holds rather than an empty list, and that a
+      stream saved through the API is written back onto that same volume. Outer half + legacy probe.
+      It runs in its own container and its own volume, both removed in the `finally`.
+* (q) THE SAME LEGACY SHAPE WITH AN EMPTY VOLUME, in a THIRD container: a named volume holding NO
+      streams.json, mounted at /data, and again no environment at all. That is a legacy-shaped stack
+      which has simply not saved anything yet — a deployment of the old shape just created, a volume
+      restored empty, a file removed by hand. (p) CANNOT SEE THIS CASE, because (p) seeds a
+      streams.json onto its volume BEFORE mounting it: with that file already there, an entrypoint
+      that tests for the legacy FILE and one that tests for the legacy MOUNT both fire, and (p)
+      comes out green on either. So this check asserts where the FIRST SAVE actually lands —
+      `docker diff` says nothing was written into the container's writable layer at /app/data, and
+      the volume, read back from a throwaway container, holds the stream the API accepted. Outer
+      half + empty-legacy-volume probe. Its own container and its own volume, both removed in the
+      `finally`.
+
+WHY (p) AND (q) ARE HERE AT ALL, AND WHY NEITHER REPLACES THE OTHER
+-------------------------------------------------------------------
+An empty answer is a VALID answer everywhere else in this service. `load_streams()` returns [] for a
+file that is not there, /api/streams answers 200 with it, /api/stats answers 200 with an empty list,
+and the compose healthcheck is satisfied — so a container that is looking at the wrong directory is
+indistinguishable, from the outside, from a container that has not been configured yet. Portainer's
+updater then records a successful deploy and rolls nothing back. There is no other copy of
+streams.json: it holds every stream with its MQTT and InfluxDB credentials. So the one shape this
+gate must be able to reproduce is the one where the deployment and the image disagree about where
+that file is, and (p) is that shape.
+
+(q) is that same shape with the file NOT WRITTEN YET, and it is a check of its own because the
+detection has already been wrong twice in exactly that gap. First it did not exist at all and the
+image defaulted to /app/data; then it asked for the legacy FILE instead of the legacy MOUNT — which
+(p) is structurally blind to, since it puts a streams.json on the volume before mounting it and both
+tests are then true. A legacy-shaped deployment whose volume was still empty therefore resolved to
+/app/data, and with the Dockerfile's VOLUME line gone that path is the container's WRITABLE LAYER:
+the first stream saved through the UI survived a restart and was destroyed by the next automatic
+image update, while the container stayed healthy and /api/stats went on answering 200. So (q) mounts
+an EMPTY volume in the legacy shape and asks where the first save lands. Neither check subsumes the
+other — (p) is the volume that already holds a configuration, (q) is the volume that does not hold
+one yet, and only (q) can go red on a detection that looks at the file instead of at the mount. See
+the docstring of check_empty_legacy_layout() before deciding one of them is redundant.
 
 Two properties matter and are easy to lose, so they are stated where they can be checked:
 
@@ -154,27 +203,72 @@ IMAGE_ENV = "SMOKE_IMAGE"
 NAME_ENV = "SMOKE_NAME"
 
 SERVE_SUFFIX = "-serve"
+# The second container: the image started the way the OLDER deployments really start it. See
+# check_legacy_layout().
+LEGACY_SUFFIX = "-legacy"
+# The third container: the SAME older shape as the second, but with a volume that holds nothing yet.
+# A name of its own rather than a reuse of the one above — both containers exist at the same time by
+# the end of the run, and the cleanup has to be able to name each of them. See
+# check_empty_legacy_layout().
+EMPTY_LEGACY_SUFFIX = "-legacy-empty"
+# The two SHORT-LIVED containers: the one that seeds check (p)'s volume and the one that reads check
+# (q)'s volume back. Both run `--rm` and both live for a second, which is exactly why they still need
+# names. `--rm` is the DAEMON removing the container when the process exits; when a bound in docker()
+# fires it kills the docker CLIENT on the runner and leaves the container running on the daemon,
+# which nothing then ever removes — this runner's daemon is shared by the whole fleet and outlives
+# every job. The read-back one is the worse of the two: it holds the named volume open, so
+# remove_volume() below would fail as well and the volume would leak with it.
+#
+# Appended to the ALREADY-SUFFIXED name each check was given, so the container reads as what it is —
+# `<run>-legacy-seed`, `<run>-legacy-empty-readback` — and the concatenated suffixes below are what
+# the cleanup has to know.
+SEED_SUFFIX = "-seed"
+READBACK_SUFFIX = "-readback"
 # Kept in step with the cleanup step in both workflows, which removes the same suffixes.
-ALL_SUFFIXES = (SERVE_SUFFIX,)
+ALL_SUFFIXES = (SERVE_SUFFIX, LEGACY_SUFFIX, EMPTY_LEGACY_SUFFIX,
+                LEGACY_SUFFIX + SEED_SUFFIX, EMPTY_LEGACY_SUFFIX + READBACK_SUFFIX)
+# The NAMED volumes this gate creates. Named after the run for the same reason the containers are:
+# one docker daemon serves every repository on this runner, and two concurrent runs must not collide
+# on them. Both workflows remove these names too, under `if: always()`.
+#
+# TWO volumes and not one reused twice, because the ONLY difference between check (p) and check (q)
+# is that one of them holds a streams.json and the other holds nothing: sharing a volume would have
+# the second check run against the first one's fixture, which is precisely the blindness (q) exists
+# to remove.
+LEGACY_VOLUME_SUFFIX = "-legacy-data"
+EMPTY_LEGACY_VOLUME_SUFFIX = "-legacy-empty-data"
+ALL_VOLUME_SUFFIXES = (LEGACY_VOLUME_SUFFIX, EMPTY_LEGACY_VOLUME_SUFFIX)
 
 # ── what the image is supposed to declare ─────────────────────────────────────────────────────────
 APP_DIR = "/app"
 # The uid the Dockerfile creates and /entrypoint.sh drops to. Spelled out on this side too, and not
 # only inside the probes, because the repair check below has to `docker exec` AS that uid.
 APP_UID = 1000
-STATE_DIR = "/data"
+STATE_DIR = "/app/data"
+# Where the OLDER stacks bind their volume. They pass no environment at all, so this path is not a
+# setting anywhere — it is a fact about deployments that already exist, and /entrypoint.sh detects
+# it. check_legacy_layout() reproduces exactly that shape.
+LEGACY_STATE_DIR = "/data"
 EXPECTED_CMD = ["python", "main.py"]
 # Pinned to an exact value, not merely "there is one". This is the ONLY evidence this gate has that
 # the privilege-dropping wrapper is still on the image: every in-container check below enters through
 # `docker exec`, which walks straight past the entrypoint, so an image that lost it would answer all
 # of them exactly as it does now while quietly going back to serving as root.
 EXPECTED_ENTRYPOINT = ["/entrypoint.sh"]
-# `DATA_DIR=/data` is not decoration: src/config.py reads it once at import and every stream this
-# service knows about lives in one file under it. An image that lost this variable would default to
-# the same "/data" today — and would silently start writing into the container's writable layer the
-# day that default in the source changes, where the next image update takes the configuration with
-# it.
-EXPECTED_DATA_DIR = "DATA_DIR=/data"
+# THE IMAGE MUST NOT DECLARE DATA_DIR AT ALL, and this is an assertion about an ABSENCE on purpose.
+#
+# It used to be `ENV DATA_DIR=/app/data`, pinned here as the image's declared contract. That was
+# wrong, and the way it was wrong is the reason this row now reads backwards. An always-set DATA_DIR
+# makes the two layouts in this fleet indistinguishable from inside the container: /entrypoint.sh
+# can no longer tell a deployment that CHOSE /app/data from one of the older stacks that binds its
+# volume at /data and passes nothing, so it defaults to /app/data for both — and the older stack
+# comes up on an empty directory, answers every read 200, reports healthy, and bridges nothing while
+# its real configuration sits unread at /data.
+#
+# Unset is therefore the signal the entrypoint's detection depends on, which makes re-adding the ENV
+# line a silent regression of check (p) below rather than a cosmetic change. Hence a row of its own,
+# here, in the cheapest check in the gate.
+DATA_DIR_ENV_PREFIX = "DATA_DIR="
 
 # ── what a healthy boot looks like ────────────────────────────────────────────────────────────────
 # Both are uvicorn's own lines, observed in this exact order: startup completes first, the listening
@@ -190,40 +284,96 @@ TRACEBACK_MARKER = "Traceback (most recent call last)"
 IMAGE_PROBE_MARKER = "mqtt2influx image probe ok"
 SERVICE_PROBE_MARKER = "mqtt2influx service probe ok"
 REPAIR_PROBE_MARKER = "mqtt2influx repair probe ok"
+LEGACY_PROBE_MARKER = "mqtt2influx legacy-layout probe ok"
+EMPTY_LEGACY_PROBE_MARKER = "mqtt2influx empty-legacy-volume probe ok"
 # The number of verdicts each probe is supposed to print. Compared EXACTLY rather than "at least",
 # because the failure this catches is a probe that quietly stopped checking things: every line it
 # does print says ok and it exits 0, so nothing else in this file would notice.
-# 15 = 5 files that must be in the image + 5 that must not + 5 runtime imports.
+# 15 = 5 files that must be in the image + 4 that must not + /app/data is empty + 5 runtime imports.
 EXPECTED_IMAGE_PROBE_TARGETS = 15
 # 24 = 2 process identity + 2 empty state + 12 CRUD + 2 stats + 4 static UI + 2 websocket.
 EXPECTED_SERVICE_PROBE_TARGETS = 24
-# 2 = PID 1 is still uid 1000 after the restart + it can write /data again.
+# 2 = PID 1 is still uid 1000 after the restart + it can write /app/data again.
 EXPECTED_REPAIR_PROBE_TARGETS = 2
+# 3 = the API serves the seeded stream + a stream created through the API is written back onto that
+# same volume + nothing was written to the path the deployment did not mount.
+EXPECTED_LEGACY_PROBE_TARGETS = 3
+# 2 = the POST is accepted + the service then lists what it accepted. Both of these pass on a BROKEN
+# entrypoint as well, and that is deliberate: this probe's job is only to make the service save
+# something. WHERE it landed is asked from outside, by check_empty_legacy_writes_landed(), because
+# neither `docker diff` nor a read of the volume from a throwaway container can be performed by a
+# process living inside the container under test.
+EXPECTED_EMPTY_LEGACY_PROBE_TARGETS = 2
 
 IMAGE_PROBE_ROW_PREFIX = "[in-image] "
 SERVICE_PROBE_ROW_PREFIX = "[in-container] "
 # Says which uid asked, because that is the whole difference between this probe and the other two.
 REPAIR_PROBE_ROW_PREFIX = "[in-container, as uid {}] ".format(APP_UID)
+# Says which CONTAINER asked: this one is not the -serve container every other probe runs in.
+LEGACY_PROBE_ROW_PREFIX = "[in the legacy-layout container] "
+# Says which container again, for the same reason: this is the third one, and its whole distinction
+# from the second is the state of the volume it was handed.
+EMPTY_LEGACY_PROBE_ROW_PREFIX = "[in the empty-legacy-volume container] "
 
 # Rows this file produces itself: 4 from the contract check, 1 for the container starting, 2 startup
-# markers, 1 for it still running at the end, 2 for staging and restarting on a root-owned /data,
-# 2 for the SIGTERM shutdown, 1 for the final log.
-EXPECTED_OUTER_TARGETS = 13
+# markers, 1 for it still running at the end, 2 for staging and restarting on a root-owned /app/data,
+# 2 for the SIGTERM shutdown, 1 for the final log, 3 for the legacy-layout container (seeding its
+# volume, booting it, and the warning it has to log), 5 for the empty-legacy-volume container
+# (creating its volume, booting it, the warning it has to log, `docker diff` finding nothing under
+# /app/data, and the stream read back off the volume).
+EXPECTED_OUTER_TARGETS = 21
 # Each probe contributes its own targets plus the two consistency rows run_probe() adds.
 EXPECTED_TOTAL_TARGETS = (
     EXPECTED_OUTER_TARGETS
     + EXPECTED_IMAGE_PROBE_TARGETS + 2
     + EXPECTED_SERVICE_PROBE_TARGETS + 2
-    + EXPECTED_REPAIR_PROBE_TARGETS + 2)
+    + EXPECTED_REPAIR_PROBE_TARGETS + 2
+    + EXPECTED_LEGACY_PROBE_TARGETS + 2
+    + EXPECTED_EMPTY_LEGACY_PROBE_TARGETS + 2)
 
 # ── bounds ────────────────────────────────────────────────────────────────────────────────────────
-# Every docker call is bounded. The worst case adds up to roughly fifteen minutes, against the step's
-# own 20 — the margin is there so that a gate which is merely slow fails with ITS OWN diagnosis
-# rather than being killed by act_runner, which would skip the cleanup in the `finally` below. The
-# step's `timeout-minutes` in BOTH workflows is set against this sum; adding a bounded call here
-# without revisiting it is how a gate starts being killed instead of reporting.
+# Every docker call is bounded, and the SUM of those bounds is what the smoke step's own
+# `timeout-minutes` in BOTH workflows is set against — the margin is there so that a gate which is
+# merely slow fails with ITS OWN diagnosis rather than being killed by act_runner, which would skip
+# the cleanup in the `finally` below. Adding a bounded call here without revisiting that number is
+# how a gate starts being killed instead of reporting.
+#
+# THE ARITHMETIC, so the next person can re-derive it instead of trusting it. Every bounded call on
+# the longest path, counting a wait_for_markers() as BOOT_BUDGET plus one LOGS_TIMEOUT of overshoot,
+# and counting the removals in the `finally` too:
+#
+#   the -serve container    840 s — inspect 30, rm 30, run 60, boot wait 90, image probe 120,
+#                                   service probe 120, inspect 30, chown 30, restart 60, boot wait
+#                                   90, repair probe 60, stop 60, inspect 30, final logs 30
+#   the -legacy one         450 s — volume create 30, rm of the -seed container 30, seed 60,
+#                                   rm 30, run 60, boot wait 90, probe 120, logs 30
+#   the -legacy-empty one   480 s — volume create 30, rm 30, run 60, boot wait 90, probe 120,
+#                                   diff 30, rm of the -readback container 30, read-back 60,
+#                                   logs 30
+#   the `finally`           210 s — FIVE container removals at 30 (ALL_SUFFIXES: the three long-
+#                                   lived containers plus the -seed and -readback ones), two
+#                                   volume removals at 30
+#
+# which comes to 1980 s, i.e. 33 minutes, against the step's own 40 — seven minutes of headroom,
+# not nine. The two `remove_container()` calls that precede the -seed and -readback runs, and the
+# two extra entries they added to ALL_SUFFIXES, are the difference between this sum and the 1860 s
+# that stood here before those containers were named; a removal is a bounded docker call like any
+# other and is counted like one. The figure quoted before check (q) existed was "roughly nineteen",
+# and it left the cleanup calls out of the sum entirely; everything is counted now, which is why
+# the step bound moved from 25 to 40 rather than to a number a shade over the sum.
 INSPECT_TIMEOUT = 30
 REMOVE_TIMEOUT = 30
+# Creating and destroying a named volume, and the throwaway container that seeds it.
+VOLUME_TIMEOUT = 30
+SEED_TIMEOUT = 60
+LEGACY_PROBE_TIMEOUT = 120
+EMPTY_LEGACY_PROBE_TIMEOUT = 120
+# `docker diff` on a stopped-or-running container: a single read of the container's writable layer,
+# cheap, but bounded like everything else here.
+DIFF_TIMEOUT = 30
+# The throwaway container that reads the named volume back after the probe has saved to it. Same
+# shape and the same bound as the seeding run above — a `docker run --rm` of the image under test.
+READBACK_TIMEOUT = 60
 START_TIMEOUT = 60
 LOGS_TIMEOUT = 30
 IMAGE_PROBE_TIMEOUT = 120
@@ -275,16 +425,34 @@ PRESENT = [
     (APP_DIR + "/static/index.html", "the whole web UI, in one file"),
 ]
 
-# What .dockerignore and the Dockerfile's three explicit COPY lines are supposed to keep out. Two of
-# these are size (.venv is ~65 MB of macOS wheels for an interpreter that is not in this image), and
-# two are disclosure: .git carries the full history into a public registry, and data/ on a developer
-# machine holds a real streams.json with real MQTT and InfluxDB passwords in it.
+# What .dockerignore and the Dockerfile's three explicit COPY lines are supposed to keep out. One of
+# these four is size (.venv is ~65 MB of macOS wheels for an interpreter that is not in this image);
+# one is disclosure (.git carries the full history into a public registry); the other two are
+# development scaffolding that runs from the source tree — tests/ in python:3.11-slim before the
+# image exists at all (build declares `needs: test`), ci/ against the image once it does.
+# data/ is NOT on this list: the Dockerfile creates that directory on purpose, so the claim about it
+# is emptiness rather than absence and it is asserted in EMPTY_DIRS below.
 ABSENT = [
     (APP_DIR + "/.venv", "a host-built virtualenv: ~65 MB of wheels for the wrong interpreter"),
     (APP_DIR + "/.git", "the repository history, which would ship to a public registry"),
-    (APP_DIR + "/data", "a developer's runtime state, which holds real broker credentials"),
     (APP_DIR + "/tests", "the test suite, which is run from the source tree and not from the image"),
     (APP_DIR + "/ci", "this gate itself"),
+]
+
+# The state directory itself DOES exist in the image — the Dockerfile creates and chowns it so that
+# a volume mounted there arrives owned by uid 1000 — so the claim about it is not absence but
+# EMPTINESS, and it is asserted that way rather than as "one particular filename is not there".
+#
+# The narrow version of this check was `/app/data/streams.json is NOT in the image`, and it would
+# have passed on a build that shipped `streams.json.tmp` (which src/config.py leaves behind when a
+# save is interrupted), or `streams.json.bak`, or a developer's `streams-prod.json`. Any of those is
+# a file full of real MQTT and InfluxDB passwords going to a registry, and the whole point of
+# checking here rather than trusting .dockerignore is that the check does not get to assume which
+# names a developer's data/ happens to contain.
+EMPTY_DIRS = [
+    (APP_DIR + "/data", (
+        "a developer's runtime state lives there and every file in it holds real broker "
+        "credentials; the directory belongs in the image, its contents never do")),
 ]
 
 # Imported rather than pip-listed: a wheel can be present and still fail to import (wrong platform
@@ -320,6 +488,24 @@ def check_absent(path, what):
         return (target, "could not be checked: {}".format(describe(error)))
 
 
+def check_empty(path, what):
+    target = "{} is in the image and is EMPTY".format(path)
+    try:
+        if not os.path.isdir(path):
+            return (target, (
+                "it is not a directory in the image at all. The Dockerfile creates and chowns it so "
+                "that a volume mounted there arrives owned by uid 1000; without it the mount point "
+                "is created by the daemon at start, owned by root"))
+        listed = sorted(os.listdir(path))
+        if not listed:
+            return (target, None)
+        return (target, (
+            "it holds {!r}, and it should hold nothing — {}. Either .dockerignore stopped covering "
+            "the directory's contents or the Dockerfile grew a `COPY . .`".format(listed, what)))
+    except Exception as error:
+        return (target, "could not be checked: {}".format(describe(error)))
+
+
 def check_import(module):
     target = "`import {}` works inside the image".format(module)
     try:
@@ -337,6 +523,8 @@ def main():
         rows.append(check_present(path, what))
     for path, what in ABSENT:
         rows.append(check_absent(path, what))
+    for path, what in EMPTY_DIRS:
+        rows.append(check_empty(path, what))
     for module in IMPORTS:
         rows.append(check_import(module))
 
@@ -380,9 +568,12 @@ PROBE_MARKER = "mqtt2influx service probe ok"
 BASE_URL = "http://127.0.0.1:8000"
 HTTP_TIMEOUT = 15
 
-# Written by src/config.py under DATA_DIR, which the image sets to /data.
-CONFIG_PATH = "/data/streams.json"
-STATE_DIR = "/data"
+# Written by src/config.py under DATA_DIR, which /entrypoint.sh resolves to /app/data for a
+# container started with no volume at /data — which is how the -serve container this probe runs in
+# was started. The IMAGE itself declares no DATA_DIR at all, deliberately: see DATA_DIR_ENV_PREFIX
+# in ci/smoke.py for why that absence is load-bearing and is asserted as a row of its own.
+CONFIG_PATH = "/app/data/streams.json"
+STATE_DIR = "/app/data"
 
 # The uid the Dockerfile creates and /entrypoint.sh drops to with gosu. Checked against PID 1 and
 # NOT against this probe's own uid: `docker exec` does not go through ENTRYPOINT and runs as the
@@ -479,7 +670,7 @@ def check_process_identity():
     has quietly stopped `exec`ing gosu, and no other check in this gate would see the difference —
     they all arrive through `docker exec`, which never goes through the entrypoint at all.
 
-    Runs BEFORE the CRUD cycle so that an unwritable /data is diagnosed as an unwritable /data. The
+    Runs BEFORE the CRUD cycle so that an unwritable /app/data is diagnosed as an unwritable /app/data. The
     CRUD cycle would otherwise report the same fault only as a missing streams.json, which reads
     like a store bug and sends whoever is looking into src/config.py.
     """
@@ -531,7 +722,7 @@ def check_process_identity():
 
 
 def check_empty_state():
-    """(c) A fresh /data volume means no streams — the state right after a deploy."""
+    """(c) A fresh /app/data volume means no streams — the state right after a deploy."""
     status_target = "GET /api/streams answers 200 on a fresh volume"
     body_target = "GET /api/streams is an empty list on a fresh volume"
     try:
@@ -563,8 +754,8 @@ def check_crud_cycle():
     targets = [
         "POST /api/streams answers 200 and returns a generated id",
         "POST /api/streams echoes the fields it was given",
-        "/data/streams.json exists on the container's disk after the POST",
-        "/data/streams.json holds exactly the stream that was created",
+        "/app/data/streams.json exists on the container's disk after the POST",
+        "/app/data/streams.json holds exactly the stream that was created",
         "GET /api/streams lists the created stream",
         "the listed stream reports running=false",
         "PUT /api/streams/<id> answers 200 and carries the new value",
@@ -631,7 +822,7 @@ def check_crud_cycle():
     else:
         record(targets[2], (
             "it is not there. The API answered 200, so the stream exists as far as the UI is "
-            "concerned — and would be gone the moment the container restarts. Either /data is not "
+            "concerned — and would be gone the moment the container restarts. Either /app/data is not "
             "writable by the user this image runs as, or DATA_DIR points somewhere else"))
         record(targets[3], "not attempted: the file does not exist")
 
@@ -827,7 +1018,7 @@ def check_websocket():
 
 def main():
     # First, and deliberately: it is the cheapest check here and it is the one that explains the
-    # others. A /data the serving uid cannot write turns the persistence rows below into a
+    # others. A /app/data the serving uid cannot write turns the persistence rows below into a
     # confusing report about a store that answers 200 and saves nothing.
     check_process_identity()
     check_empty_state()
@@ -858,9 +1049,9 @@ if __name__ == "__main__":
 
 
 # ══ THE REPAIR PROBE ══════════════════════════════════════════════════════════════════════════════
-# Runs LAST, inside a container that has been restarted after /data was deliberately handed back to
+# Runs LAST, inside a container that has been restarted after /app/data was deliberately handed back to
 # root:root — the state production's volume is in, and the only state in which the entrypoint's
-# `chown -R app:app /data` is load-bearing. See check_volume_repair() for why this cannot be asked
+# `chown -R app:app /app/data` is load-bearing. See check_volume_repair() for why this cannot be asked
 # of the container the rest of the gate uses.
 #
 # It is the one probe fed to `docker exec -u 1000:1000`, and that is what lets it answer by DOING rather
@@ -873,7 +1064,7 @@ import os
 PROBE_MARKER = "mqtt2influx repair probe ok"
 
 APP_UID = 1000
-STATE_DIR = "/data"
+STATE_DIR = "/app/data"
 # Created and removed again. The unlink is part of the claim rather than tidiness: src/config.py
 # saves by writing a temp file and renaming it over streams.json, so a directory that grants create
 # and refuses unlink is one this service still cannot save into.
@@ -921,10 +1112,10 @@ def main():
         rows.append((write_target, None))
     except Exception as error:
         rows.append((write_target, (
-            "it is not: {}. /data was handed back to root:root and the container restarted, which "
+            "it is not: {}. /app/data was handed back to root:root and the container restarted, which "
             "is the state production's volume is in — written by the old root-based image, and "
             "never re-seeded, because docker seeds a volume only while it is empty. Repairing that "
-            "is the ONLY thing `chown -R app:app /data` in /entrypoint.sh does, and this row is the "
+            "is the ONLY thing `chown -R app:app /app/data` in /entrypoint.sh does, and this row is the "
             "only one in this gate that can tell whether it still happens. Note what does NOT break "
             "without it: the container starts, _config_path() makedirs(exist_ok=True) succeeds on a "
             "directory that already exists, load_streams() swallows the PermissionError and returns "
@@ -942,6 +1133,422 @@ def main():
     if failures:
         print("{}: FAILED {}/{} targets".format(PROBE_MARKER, len(failures), len(rows)))
         # SystemExit and not `assert`, for the same reason as in the other two probes.
+        raise SystemExit(1)
+
+    print("{}: {}/{} targets".format(PROBE_MARKER, len(rows), len(rows)))
+
+
+if __name__ == "__main__":
+    main()
+'''
+
+
+# ══ THE LEGACY-LAYOUT PROBE ═══════════════════════════════════════════════════════════════════════
+# Runs inside the SECOND container — the one started the way the older deployments really start this
+# image: a named volume that already holds a streams.json mounted at /data, and no DATA_DIR anywhere
+# in the environment. See check_legacy_layout() for how that container is built.
+#
+# Its question is the one no other probe here can ask, because every other container in this gate is
+# started in the consistent layout: does the service read the file the deployment actually mounted?
+# An empty answer is a VALID answer from every endpoint this service has, so nothing else in this
+# gate — not the healthcheck's target, not the CRUD cycle, not the log — can tell "no streams
+# configured yet" apart from "every stream is in a directory nobody is reading".
+#
+# The two identifiers below are substituted in by check_legacy_layout() rather than written twice:
+# the same values are what it seeds the volume with, and a probe carrying its own copy could drift
+# from the seed and then assert nothing at all.
+LEGACY_PROBE = r'''
+import json
+import os
+import urllib.error
+import urllib.request
+
+PROBE_MARKER = "mqtt2influx legacy-layout probe ok"
+
+BASE_URL = "http://127.0.0.1:8000"
+HTTP_TIMEOUT = 15
+
+LEGACY_STATE_DIR = "/data"
+LEGACY_CONFIG_PATH = LEGACY_STATE_DIR + "/streams.json"
+STATE_DIR = "/app/data"
+
+EXPECTED_STREAM_ID = "@@STREAM_ID@@"
+EXPECTED_STREAM_NAME = "@@STREAM_NAME@@"
+
+# What the write half of this probe creates through the API. `.invalid` never resolves and
+# `enabled` is false, for the same reasons as everywhere else in this gate.
+NEW_STREAM = {
+    "name": "written back onto the legacy volume",
+    "mqtt_host": "mqtt.invalid",
+    "mqtt_port": 1883,
+    "mqtt_topic": "/devices/#",
+    "influx_host": "influx.invalid",
+    "influx_port": 8086,
+    "influx_database": "legacydb",
+    "enabled": False,
+}
+
+# WHY THE RESOLVED DATA_DIR IS NOT READ OUT OF PID 1's ENVIRONMENT, which would be the obvious way
+# to ask this question: /proc/<pid>/environ is not world-readable like /proc/<pid>/status is —
+# reading another process's requires PTRACE_MODE_READ, i.e. CAP_SYS_PTRACE, which docker DROPS from
+# a container's default capability set. Even the root that `docker exec` arrives as gets
+# PermissionError. Adding `--cap-add=SYS_PTRACE` to the container would answer it, at the cost of
+# no longer running the image in the shape this whole check exists to reproduce.
+#
+# So the two rows below ask by OBSERVING instead, which is the better question anyway: the service
+# serves what the mounted volume holds, and a stream created through the API is written back to that
+# same file. Between them they pin both directions of the thing that was broken.
+
+rows = []
+
+
+def record(target, reason):
+    rows.append((target, reason))
+
+
+def describe(error):
+    return "{}: {}".format(type(error).__name__, error)
+
+
+def check_seeded_stream_is_served():
+    """The API serves the stream that is really on the volume, not an empty list.
+
+    This is the whole finding in one row. `load_streams()` returns [] for a file it cannot find,
+    /api/streams answers 200 with it, /api/stats answers 200 with an empty list and the compose
+    healthcheck goes green — so an image pointed at the wrong directory is, from every other angle,
+    a healthy container. There is no second copy of streams.json.
+    """
+    target = "GET /api/streams serves the stream seeded onto the volume at {}".format(
+        LEGACY_STATE_DIR)
+    request = urllib.request.Request(BASE_URL + "/api/streams", method="GET")
+    try:
+        with urllib.request.urlopen(request, timeout=HTTP_TIMEOUT) as response:
+            status = response.status
+            body = response.read().decode("utf-8", "replace")
+    except urllib.error.HTTPError as error:
+        status = error.code
+        body = error.read().decode("utf-8", "replace")
+    except Exception as error:
+        record(target, "the request itself failed: {}".format(describe(error)))
+        return
+    if status != 200:
+        record(target, "it answered {}: {}".format(status, body[:400]))
+        return
+    try:
+        listed = json.loads(body)
+    except Exception as error:
+        record(target, "its body is not JSON ({}): {}".format(describe(error), body[:400]))
+        return
+    if (isinstance(listed, list) and len(listed) == 1
+            and listed[0].get("id") == EXPECTED_STREAM_ID
+            and listed[0].get("name") == EXPECTED_STREAM_NAME):
+        record(target, None)
+        return
+    record(target, (
+        "it returned {!r}. {}".format(listed, (
+            "AN EMPTY LIST IS THE FAILURE THIS ROW EXISTS FOR: the volume mounted at {} holds a "
+            "streams.json with this stream in it, and the service is answering as though there "
+            "were no configuration at all. Every endpoint still answers 200, the healthcheck still "
+            "goes green, and an updater would record this deploy as a success while the bridge "
+            "subscribed to nothing".format(LEGACY_STATE_DIR)
+        ) if listed == [] else (
+            "the volume at {} holds exactly one stream, id {!r} named {!r}".format(
+                LEGACY_STATE_DIR, EXPECTED_STREAM_ID, EXPECTED_STREAM_NAME)))))
+
+
+def check_writes_land_on_the_mounted_volume():
+    """A stream created through the API is written back to the volume the deployment mounted.
+
+    The other direction of the same fault, and it is the one that makes a wrong DATA_DIR permanent
+    rather than merely useless: an operator who finds an empty UI and re-creates a stream by hand
+    gets a 200, sees it listed, and has written it into a directory the next image update discards.
+    So this asks the file — not the API's echo of its own success.
+    """
+    target = "a stream created through the API is written into {}".format(LEGACY_CONFIG_PATH)
+    payload = json.dumps(NEW_STREAM).encode("utf-8")
+    request = urllib.request.Request(
+        BASE_URL + "/api/streams", data=payload,
+        headers={"Content-Type": "application/json"}, method="POST")
+    try:
+        with urllib.request.urlopen(request, timeout=HTTP_TIMEOUT) as response:
+            status = response.status
+            body = response.read().decode("utf-8", "replace")
+    except urllib.error.HTTPError as error:
+        status = error.code
+        body = error.read().decode("utf-8", "replace")
+    except Exception as error:
+        record(target, "the POST itself failed: {}".format(describe(error)))
+        return
+    if status != 200:
+        record(target, "the POST answered {}: {}".format(status, body[:400]))
+        return
+    try:
+        created_id = json.loads(body).get("id")
+    except Exception as error:
+        record(target, "the POST's body is not JSON ({}): {}".format(describe(error), body[:400]))
+        return
+    if not created_id:
+        record(target, "the POST answered 200 but returned no id: {}".format(body[:400]))
+        return
+    try:
+        with open(LEGACY_CONFIG_PATH) as handle:
+            on_disk = json.load(handle)
+    except Exception as error:
+        record(target, (
+            "{} could not be read back after the POST: {}. The API reported success, so the stream "
+            "exists as far as the UI is concerned — and is not on the volume".format(
+                LEGACY_CONFIG_PATH, describe(error))))
+        return
+    ids = [record_.get("id") for record_ in on_disk] if isinstance(on_disk, list) else None
+    if ids is not None and created_id in ids and EXPECTED_STREAM_ID in ids:
+        record(target, None)
+        return
+    record(target, (
+        "after the POST the file holds ids {!r}; it must hold both the seeded {!r} and the new {!r}. "
+        "A save that goes anywhere else lands in the container's writable layer, where the next "
+        "image update deletes it — and an operator who found an empty UI and re-entered a stream "
+        "would have no way of knowing".format(ids, EXPECTED_STREAM_ID, created_id)))
+
+
+def check_nothing_written_to_the_unmounted_path():
+    """Nothing was created at the path the deployment did NOT mount.
+
+    A container that resolved DATA_DIR correctly never touches /app/data. One that did not would
+    leave a streams.json there — in the container's writable layer, which the next image update
+    discards — and this row names that directly instead of leaving it to be inferred from the row
+    above.
+    """
+    target = "{} was left untouched: nothing was written to the path nobody mounted".format(
+        STATE_DIR)
+    try:
+        listed = sorted(os.listdir(STATE_DIR))
+    except FileNotFoundError:
+        record(target, None)
+        return
+    except Exception as error:
+        record(target, "{} could not be listed: {}".format(STATE_DIR, describe(error)))
+        return
+    record(target, None if not listed else (
+        "it holds {!r}. The app is writing to the image's own directory rather than to the volume "
+        "the deployment mounted, so everything saved through the UI lives in the container's "
+        "writable layer and is discarded by the next image update".format(listed)))
+
+
+def main():
+    # Read first, then write, then the negative: a failing read explains a failing write, and the
+    # "nothing at /app/data" row is only interesting once something has actually been saved.
+    check_seeded_stream_is_served()
+    check_writes_land_on_the_mounted_volume()
+    check_nothing_written_to_the_unmounted_path()
+
+    failures = []
+    for target, reason in rows:
+        if reason is None:
+            print("ok   {}".format(target))
+        else:
+            print("FAIL {} -> {}".format(target, reason))
+            failures.append(target)
+
+    if failures:
+        print("{}: FAILED {}/{} targets".format(PROBE_MARKER, len(failures), len(rows)))
+        # SystemExit and not `assert`, for the same reason as in the other three probes.
+        raise SystemExit(1)
+
+    print("{}: {}/{} targets".format(PROBE_MARKER, len(rows), len(rows)))
+
+
+if __name__ == "__main__":
+    main()
+'''
+
+# What check_legacy_layout() writes into the volume, and what LEGACY_PROBE looks for. `.invalid` is
+# reserved by RFC 2606 and never resolves; `enabled` is FALSE for the same reason it is in the
+# service probe — a true one would have the manager dial a hostname that does not exist, forever.
+#
+# The id is a fixed, recognisable literal rather than a uuid4: this stream has to be identifiable in
+# the probe's output at a glance, and "the service returned the stream that was really on the disk"
+# is a claim worth being able to read straight out of a CI log.
+LEGACY_STREAM = {
+    "id": "smoke-legacy-layout-stream",
+    "name": "seeded onto the volume at /data",
+    "mqtt_host": "mqtt.invalid",
+    "mqtt_port": 1883,
+    "mqtt_user": "legacy-user",
+    "mqtt_password": "legacy-password",
+    "mqtt_topic": "/devices/#",
+    "topic_prefix": "legacy",
+    "influx_host": "influx.invalid",
+    "influx_port": 8086,
+    "influx_user": "legacy-influx-user",
+    "influx_password": "legacy-influx-password",
+    "influx_database": "legacydb",
+    "enabled": False,
+}
+
+# The two lines /entrypoint.sh must print when it takes the fallback. Checked as a row of its own,
+# because a fallback that happens SILENTLY is a deployment nobody ever fixes: the operator has no
+# way to learn that the container is running on a guess rather than on a decision.
+#
+# BOTH legacy checks look for these, and in (q) the row is a discriminator rather than a courtesy: on
+# a detection that tests for the legacy FILE, a volume with no streams.json on it does not look
+# legacy at all, so DATA_DIR silently becomes /app/data and NOTHING is printed. In (p) the same row
+# can only catch a fallback that was taken quietly.
+LEGACY_WARN_MARKERS = (
+    "WARN: DATA_DIR is not set",
+    "DATA_DIR={}".format(LEGACY_STATE_DIR),
+)
+
+# The name the empty-legacy-volume probe gives the one stream it creates. Declared out here because
+# it is used on BOTH sides of that check: the probe POSTs it from inside the container, and
+# check_empty_legacy_writes_landed() looks for it in the file it reads back off the volume from a
+# throwaway container. Two copies could drift, and a drifted copy would make the read-back row
+# assert nothing.
+EMPTY_LEGACY_STREAM_NAME = "saved onto a legacy volume that started out empty"
+
+
+# ══ THE EMPTY-LEGACY-VOLUME PROBE ═════════════════════════════════════════════════════════════════
+# Runs inside the THIRD container: the same shape the older deployments have — a named volume mounted
+# at /data and no DATA_DIR anywhere in the environment — except that the volume arrived EMPTY.
+#
+# It asserts almost nothing, and that is deliberate. Both rows below pass on a BROKEN entrypoint
+# exactly as they do on a working one: the API answers 200 and then lists what it accepted whichever
+# directory it is really writing to, and that indistinguishability IS the disease. This probe's only
+# job is to make the service perform one save. WHERE that save landed is asked from outside by
+# check_empty_legacy_writes_landed(), with `docker diff` and a read of the volume — neither of which
+# a process living inside this container can perform about itself.
+EMPTY_LEGACY_PROBE = r'''
+import json
+import urllib.error
+import urllib.request
+
+PROBE_MARKER = "mqtt2influx empty-legacy-volume probe ok"
+
+BASE_URL = "http://127.0.0.1:8000"
+HTTP_TIMEOUT = 15
+
+# Substituted in by check_empty_legacy_layout() rather than written twice: the outer half looks for
+# this same name in the file it reads back off the volume.
+STREAM_NAME = "@@STREAM_NAME@@"
+
+# `.invalid` is reserved by RFC 2606 and never resolves; `enabled` is false so that src/api.py does
+# not schedule a connection to it. Same reasons as everywhere else in this gate.
+NEW_STREAM = {
+    "name": STREAM_NAME,
+    "mqtt_host": "mqtt.invalid",
+    "mqtt_port": 1883,
+    "mqtt_topic": "/devices/#",
+    "influx_host": "influx.invalid",
+    "influx_port": 8086,
+    "influx_database": "emptylegacydb",
+    "enabled": False,
+}
+
+rows = []
+# The id the POST hands back. src/api.py's create_stream() pops any client-supplied id and generates
+# its own, so it cannot be pinned from here — it is carried between the two checks instead.
+created = {}
+
+
+def record(target, reason):
+    rows.append((target, reason))
+
+
+def describe(error):
+    return "{}: {}".format(type(error).__name__, error)
+
+
+def call(method, path, payload=None):
+    """(status, body), or (None, description) when the request could not be made at all."""
+    data = None if payload is None else json.dumps(payload).encode("utf-8")
+    headers = {} if data is None else {"Content-Type": "application/json"}
+    request = urllib.request.Request(BASE_URL + path, data=data, headers=headers, method=method)
+    try:
+        with urllib.request.urlopen(request, timeout=HTTP_TIMEOUT) as response:
+            return response.status, response.read().decode("utf-8", "replace")
+    except urllib.error.HTTPError as error:
+        return error.code, error.read().decode("utf-8", "replace")
+    except Exception as error:
+        return None, describe(error)
+
+
+def check_the_save_is_accepted():
+    """The service accepts a stream on a deployment whose volume arrived empty.
+
+    A PRECONDITION for the two outer rows, not the finding itself: a 200 here says nothing about
+    which directory was written, and this row is green on the broken entrypoint too. It is worth a
+    row of its own for the failure it separates out — if the POST were refused, `docker diff` and
+    the volume read-back would both report "nothing was written anywhere" and read as a
+    wrong-directory bug rather than as a service that never saved anything.
+    """
+    target = "POST /api/streams is accepted on a deployment whose volume arrived EMPTY"
+    status, body = call("POST", "/api/streams", NEW_STREAM)
+    if status is None:
+        record(target, "the POST itself failed: {}".format(body))
+        return
+    if status != 200:
+        record(target, "it answered {}: {}".format(status, body[:400]))
+        return
+    try:
+        created["id"] = json.loads(body).get("id")
+    except Exception as error:
+        record(target, "its body is not JSON ({}): {}".format(describe(error), body[:400]))
+        return
+    if not created.get("id"):
+        record(target, "it answered 200 but returned no id: {}".format(body[:400]))
+        return
+    record(target, None)
+
+
+def check_the_service_lists_what_it_saved():
+    """The stream comes back from GET /api/streams — i.e. the service can re-read its own write.
+
+    Also green on the broken entrypoint, and for the same reason: the app reads back from whatever
+    directory it wrote to, so this proves round-tripping and not location. It is here so that the
+    outer rows have something unambiguous to contrast with — "the API accepted it, serves it, and it
+    is nowhere on the volume the deployment mounted" is the sentence check (q) exists to be able to
+    say.
+    """
+    target = "GET /api/streams then lists the stream that was just created"
+    if not created.get("id"):
+        record(target, "not attempted: the POST above did not produce a stream")
+        return
+    status, body = call("GET", "/api/streams")
+    if status is None:
+        record(target, "the request itself failed: {}".format(body))
+        return
+    if status != 200:
+        record(target, "it answered {}: {}".format(status, body[:400]))
+        return
+    try:
+        listed = json.loads(body)
+    except Exception as error:
+        record(target, "its body is not JSON ({}): {}".format(describe(error), body[:400]))
+        return
+    ids = [entry.get("id") for entry in listed] if isinstance(listed, list) else None
+    if ids is not None and created["id"] in ids:
+        record(target, None)
+        return
+    record(target, (
+        "it returned {!r}, which does not contain the stream {!r} the POST just reported creating. "
+        "The save was accepted and then lost between the write and the read".format(
+            listed, created["id"])))
+
+
+def main():
+    check_the_save_is_accepted()
+    check_the_service_lists_what_it_saved()
+
+    failures = []
+    for target, reason in rows:
+        if reason is None:
+            print("ok   {}".format(target))
+        else:
+            print("FAIL {} -> {}".format(target, reason))
+            failures.append(target)
+
+    if failures:
+        print("{}: FAILED {}/{} targets".format(PROBE_MARKER, len(failures), len(rows)))
+        # SystemExit and not `assert`, for the same reason as in the other four probes.
         raise SystemExit(1)
 
     print("{}: {}/{} targets".format(PROBE_MARKER, len(rows), len(rows)))
@@ -994,11 +1601,28 @@ def docker(args, timeout, stdin_text=None):
 def remove_container(name):
     """Best effort. Never the reason a check fails; the workflow cleans up too.
 
-    `-v` matters here and is not the usual boilerplate: the Dockerfile declares VOLUME ["/data"], so
-    every `docker run` of this image creates an ANONYMOUS volume. Removing the container without it
-    leaves that volume behind on a daemon shared by the whole fleet, one per run, forever.
+    `-v` removes the container's ANONYMOUS volumes. The image no longer declares a VOLUME — that
+    line was dropped precisely because it made every container of it create one — so today there are
+    none to remove and the flag is insurance rather than necessity. It is kept for the day something
+    adds a VOLUME back: this daemon is shared by the whole fleet, and a leaked volume per CI run
+    accumulates silently and forever. It does NOT touch the named volume this gate creates; that one
+    is removed by name in remove_volume().
     """
     docker(["rm", "-f", "-v", name], REMOVE_TIMEOUT)
+
+
+def remove_volume(name):
+    """Best effort, for the one NAMED volume this gate creates. The workflows remove it too.
+
+    Separate from remove_container() because a named volume outlives every container that mounted
+    it: `docker rm -v` deliberately never removes one, since by design somebody else may still want
+    it. Only an explicit removal by name gets rid of it, and without that this runner would collect
+    one dead volume per CI run.
+
+    Ordering matters and is the caller's responsibility: the container that mounts it has to be gone
+    first, or the daemon refuses with "volume is in use".
+    """
+    docker(["volume", "rm", name], VOLUME_TIMEOUT)
 
 
 def probe_report_rows(output, prefix):
@@ -1058,7 +1682,7 @@ def check_image_contract(image):
         "the image declares CMD {}".format(EXPECTED_CMD),
         "the image declares WORKDIR {}".format(APP_DIR),
         "the image declares ENTRYPOINT {}".format(EXPECTED_ENTRYPOINT),
-        "the image declares {} in its environment".format(EXPECTED_DATA_DIR),
+        "the image declares NO {} in its environment".format(DATA_DIR_ENV_PREFIX),
     ]
     status, output = docker(["inspect", "--format", "{{json .Config}}", image], INSPECT_TIMEOUT)
     if status is None:
@@ -1092,25 +1716,34 @@ def check_image_contract(image):
 
     entrypoint = config.get("Entrypoint")
     rows.append((targets[2], None if entrypoint == EXPECTED_ENTRYPOINT else (
-        "it declares {!r}. /entrypoint.sh is what starts as root, chowns /data so a volume written "
+        "it declares {!r}. /entrypoint.sh is what starts as root, chowns /app/data so a volume written "
         "by the older root-based image stays usable, and `exec`s gosu to drop to uid 1000. "
         "`docker exec` bypasses ENTRYPOINT, so every in-container check in this gate would keep "
         "passing while the container went back to serving as root".format(entrypoint))))
 
     env = config.get("Env") or []
-    rows.append((targets[3], None if EXPECTED_DATA_DIR in env else (
-        "its environment is {!r}. src/config.py reads DATA_DIR once at import and puts every stream "
-        "this service knows about in one file under it; the wrong value writes the configuration "
-        "into the container layer, where the next image update takes it away".format(env))))
+    declared = [entry for entry in env if entry.startswith(DATA_DIR_ENV_PREFIX)]
+    rows.append((targets[3], None if not declared else (
+        "it declares {!r}. That variable must be UNSET on the image: /entrypoint.sh uses 'DATA_DIR "
+        "is not set' as the signal that a deployment did not choose a path, and only then falls "
+        "back to detecting the older layout — a volume bound at {} with no environment at all. "
+        "Declaring it here makes that case unobservable from inside the container, so those stacks "
+        "would come up on an empty {}, answer every read 200, report healthy, and bridge nothing "
+        "while their real configuration sat unread. The default lives in /entrypoint.sh and "
+        "src/settings.py, not in an ENV line".format(declared, LEGACY_STATE_DIR, STATE_DIR))))
     return rows
 
 
 def start_serving_container(image, name):
     """(b) Start the image with its REAL command and nothing else.
 
-    No environment overrides, no published port, no bind mount — see the module docstring. /data is
-    the anonymous volume the Dockerfile's VOLUME line creates, which is exactly the fresh, empty
-    volume the empty-state check needs.
+    No environment overrides, no published port, no mount at all — see the module docstring. /app/data
+    is therefore the image's own directory, created and chowned to uid 1000 at build time, which is
+    exactly the fresh and empty state the empty-state check needs. It is also the state a deployment
+    that mounts a brand-new named volume there arrives in, since docker seeds an empty volume from
+    the image directory, ownership included.
+
+    This is the CONSISTENT layout, and everything except check_legacy_layout() runs in it.
     """
     target = "`docker run -d` starts the image with its own command"
     remove_container(name)
@@ -1254,25 +1887,26 @@ def check_container_alive(name, started):
 def check_volume_repair(name, started):
     """(n) Stage the volume production actually has, and make the entrypoint repair it.
 
-    WHY THIS EXISTS AT ALL. Check (m) — "/data is writable by the uid PID 1 runs as" — cannot fail
+    WHY THIS EXISTS AT ALL. Check (m) — "/app/data is writable by the uid PID 1 runs as" — cannot fail
     on the container the rest of this gate uses, and a check that cannot fail is a comment. The
-    container is started with no `-v`, so /data is the anonymous volume the Dockerfile's VOLUME line
-    creates; docker seeds a fresh volume from the image's own directory, ownership included, and the
-    image ran `mkdir -p /data && chown app:app /data` at build time. The volume therefore arrives
-    owned by uid 1000 no matter what the entrypoint does. Delete `chown -R app:app /data` from
-    entrypoint.sh and every row in this gate stays green.
+    container is started with no `-v` and the image declares no VOLUME, so /app/data is not a volume
+    at all: it is the directory baked into the IMAGE LAYER, which the image built with
+    `mkdir -p /app/data && chown app:app /app/data`, reached through the container's writable layer.
+    It therefore starts out owned by uid 1000 no matter what the entrypoint does, and `docker
+    restart` — which reuses the same container and the same writable layer — does not reset it.
+    Delete `chown -R app:app /app/data` from entrypoint.sh and every row in this gate stays green.
 
     Production is the case that is left over, and it is the only case the line was written for: its
-    volume was created by the ROOT-based version of this image, holds files, and is therefore never
-    re-seeded — docker seeds a volume only while it is empty. On that volume the entrypoint's chown
-    is the single thing standing between the deploy and a container that comes up healthy and
+    NAMED volume was created by the ROOT-based version of this image, holds files, and is therefore
+    never re-seeded — docker seeds a volume only while it is empty. On that volume the entrypoint's
+    chown is the single thing standing between the deploy and a container that comes up healthy and
     silently persists nothing.
 
     So the state is staged rather than hoped for. `docker exec` arrives as root precisely because it
-    does not go through the ENTRYPOINT, which makes it the one way to put /data back under root from
+    does not go through the ENTRYPOINT, which makes it the one way to put /app/data back under root from
     outside; the restart then runs the entrypoint again over it. A working entrypoint chowns it back
     before gosu drops privileges, and the repair probe writes its file. An entrypoint that lost the
-    chown leaves /data at 0:0 and that write raises PermissionError — while everything else about
+    chown leaves /app/data at 0:0 and that write raises PermissionError — while everything else about
     the container looks exactly as it did a moment ago.
 
     Returns (rows, ready): `ready` gates the repair probe, because a probe run against a container
@@ -1329,7 +1963,7 @@ def check_volume_repair(name, started):
     if missing:
         rows.append((restart_target, (
             "it never printed {} a second time within {} s. The entrypoint runs again on every "
-            "start, and a container that does not come back from a /data it cannot chown is one "
+            "start, and a container that does not come back from an /app/data it cannot chown is one "
             "that now EXITS on it — which under `restart: always` is not a failed deploy but an "
             "unbounded restart loop, and a bridge in a restart loop is losing every message "
             "published while it is down".format(missing, BOOT_BUDGET))))
@@ -1393,6 +2027,397 @@ def check_sigterm_shutdown(name, started):
                        "and the shutdown path that flushes never executed.",
             }.get(code, "That is neither a clean exit nor a signal this gate recognises.")))))
     return rows
+
+
+def check_legacy_layout(image, name, volume):
+    """(p) Start the image the way the OLDER deployments really start it, and see what it serves.
+
+    WHY NOTHING ELSE IN THIS GATE COVERS THIS. Every other container here is started with no `-v`,
+    no environment and no port — the CONSISTENT layout, in which the app's default and the mount
+    agree by construction. The deployments that exist in this fleet are not all shaped that way:
+    the older stacks bind the volume at /data and set NO environment variables at all, and they
+    carry `io.portainer.update.enable`, so they take a new :latest by themselves. That combination —
+    a volume somewhere the image does not default to, and nothing in the environment saying so — is
+    the one this gate could never reproduce, and it is also the one that costs the most.
+
+    WHAT GOING WRONG LOOKS LIKE, WHICH IS WHY THE CHECK HAS TO BE THIS SHAPE. Not a crash. The
+    container starts, the entrypoint chowns whatever it decided on, load_streams() finds no file and
+    returns [], /api/streams answers 200 with an empty list, /api/stats — the compose healthcheck's
+    target — answers 200 as well, the container reports HEALTHY, and the updater records a
+    successful deploy and rolls nothing back. The volume holding every stream, with its MQTT and
+    InfluxDB credentials, stays mounted at /data and is read by nobody, and the bridge writes
+    nothing while logging no error. So the assertion cannot be "it came up" or "it answers": it has
+    to be that the streams which are REALLY on the volume are the streams it serves.
+
+    HOW THE STATE IS BUILT WITHOUT A BIND MOUNT. A host path cannot be handed to the daemon from
+    this job (see the module docstring), but a NAMED volume is daemon-side and means the same to
+    both. So: create one, seed it through a throwaway container of the image itself with
+    `--entrypoint python` — which both skips the entrypoint under test and writes the file as ROOT,
+    which is exactly how production's volume was written by the old root-based image — and then
+    mount it at /data on a second long-running container with no environment at all.
+
+    Returns (rows, ready): `ready` gates the probe, so a probe run against a container that never
+    came up cannot report its own failure to connect as a verdict about where the app is looking.
+    """
+    seed_target = "a volume holding a streams.json can be seeded and mounted at {}".format(
+        LEGACY_STATE_DIR)
+    start_target = (
+        "the image starts with that volume at {} and NO DATA_DIR, and reaches uvicorn's startup "
+        "markers".format(LEGACY_STATE_DIR))
+    warn_target = "its log warns that DATA_DIR is unset and names the path it fell back to"
+
+    # --- create and seed the volume ---------------------------------------------------------------
+    status, output = docker(["volume", "create", volume], VOLUME_TIMEOUT)
+    if status is None:
+        return [(seed_target, output),
+                (start_target, "not attempted: " + output),
+                (warn_target, "not attempted: " + output)], False
+    if status != 0:
+        reason = "`docker volume create {}` exited {}:\n{}".format(
+            volume, status, excerpt(output))
+        return [(seed_target, reason),
+                (start_target, "not attempted: " + reason),
+                (warn_target, "not attempted: " + reason)], False
+
+    # Built here and handed to the interpreter as one argv element, so nothing goes through a shell
+    # and the JSON needs no quoting beyond repr(). json.dumps first, so what lands on the volume is
+    # exactly the shape src/config.py writes: a list of objects.
+    payload = json.dumps([LEGACY_STREAM])
+    seed_program = (
+        "import os\n"
+        "os.makedirs({directory!r}, exist_ok=True)\n"
+        "with open(os.path.join({directory!r}, 'streams.json'), 'w') as handle:\n"
+        "    handle.write({payload!r})\n"
+        "print('seeded ' + os.path.join({directory!r}, 'streams.json'))\n"
+    ).format(directory=LEGACY_STATE_DIR, payload=payload)
+
+    # `--entrypoint python` on purpose, twice over: it keeps the entrypoint under test out of the
+    # SEEDING step, and it leaves the file owned by root — the state production's volume is really
+    # in, since it was written by the version of this image that still ran as root. The entrypoint's
+    # chown then has to repair it on the real container below, which is a second thing this check
+    # exercises for free.
+    # NAMED even though it is `--rm` and lives for a second: see SEED_SUFFIX. The removal beforehand
+    # is what makes the name safe to reuse if a previous run was killed before its own cleanup.
+    remove_container(name + SEED_SUFFIX)
+    status, output = docker(
+        ["run", "--rm", "--name", name + SEED_SUFFIX,
+         "-v", "{}:{}".format(volume, LEGACY_STATE_DIR),
+         "--entrypoint", "python", image, "-c", seed_program],
+        SEED_TIMEOUT)
+    if status is None:
+        return [(seed_target, output),
+                (start_target, "not attempted: " + output),
+                (warn_target, "not attempted: " + output)], False
+    if status != 0:
+        reason = "seeding the volume exited {}:\n{}".format(status, excerpt(output))
+        return [(seed_target, reason),
+                (start_target, "not attempted: " + reason),
+                (warn_target, "not attempted: " + reason)], False
+    rows = [(seed_target, None)]
+
+    # --- start the container the way the old stacks do --------------------------------------------
+    # No `-e`, no `--env`, no port: this argv IS the claim. Anything added here would make the check
+    # test some other deployment than the one that exists.
+    remove_container(name)
+    status, output = docker(
+        ["run", "-d", "--name", name, "-v", "{}:{}".format(volume, LEGACY_STATE_DIR), image],
+        START_TIMEOUT)
+    if status is None:
+        rows.append((start_target, output))
+        rows.append((warn_target, "not attempted: " + output))
+        return rows, False
+    if status != 0:
+        reason = "`docker run -d` exited {}:\n{}".format(status, excerpt(output))
+        rows.append((start_target, reason))
+        rows.append((warn_target, "not attempted: " + reason))
+        return rows, False
+
+    log_status, logs = wait_for_markers(name, STARTUP_MARKERS, BOOT_BUDGET)
+    if log_status is None:
+        reason = "`docker logs` produced no exit code — {}".format(logs)
+        rows.append((start_target, reason))
+        rows.append((warn_target, "not attempted: " + reason))
+        return rows, False
+    if log_status != 0:
+        # Same distinction the other log-reading checks make: on a non-zero exit `logs` is docker's
+        # complaint and not the container's output, so searching it for markers would blame the
+        # image for a daemon that would not answer.
+        reason = "`docker logs` exited {}:\n{}".format(log_status, excerpt(logs))
+        rows.append((start_target, reason))
+        rows.append((warn_target, "not attempted: " + reason))
+        return rows, False
+
+    missing = [marker for marker in STARTUP_MARKERS if marker not in logs]
+    if missing:
+        rows.append((start_target, (
+            "it never printed {} within {} s. Under the legacy layout the entrypoint has more to do "
+            "than usual — resolve DATA_DIR, then chown a volume written by root — and a failure in "
+            "either is an exit before `exec`, which under `restart: always` is an unbounded restart "
+            "loop rather than a failed deploy.\nLog:\n{}".format(
+                missing, BOOT_BUDGET, excerpt(logs)))))
+        rows.append((warn_target, "not attempted: the container did not finish starting"))
+        return rows, False
+    rows.append((start_target, None))
+
+    absent = [marker for marker in LEGACY_WARN_MARKERS if marker not in logs]
+    rows.append((warn_target, None if not absent else (
+        "the log is missing {}. The fallback is a compatibility measure, not a configuration, and a "
+        "silent one is a deployment nobody ever fixes: the operator has no way to learn that this "
+        "container found its configuration by guessing rather than by being told. The warning has "
+        "to name both paths and say that DATA_DIR should be set explicitly".format(absent))))
+    return rows, True
+
+
+def check_empty_legacy_layout(image, name, volume):
+    """(q) The legacy SHAPE with an EMPTY volume — the case check (p) is structurally blind to.
+
+    WHAT THIS DEFENDS. /entrypoint.sh has to recognise a deployment of the OLDER shape — volume bound
+    at /data, no environment at all — and resolve DATA_DIR to /data for it. That recognition has been
+    wrong twice, and both times it failed SILENTLY: a healthy container serving an empty stream list
+    while the real configuration sat unread on the volume. First there was no detection at all and
+    the image defaulted to /app/data. Then the detection asked for the legacy FILE
+    (`[ -e /data/streams.json ]`) rather than for the legacy MOUNT (`[ -d /data ]`), so a
+    legacy-shaped deployment whose volume held no streams.json YET — one just created, one restored
+    empty, one whose file was removed by hand — fell through to /app/data, which since the Dockerfile
+    dropped its VOLUME line is the container's WRITABLE LAYER. The first stream the operator saved
+    through the UI survived a `restart` and was destroyed by the next automatic image update, and
+    since that update never created /data/streams.json either, the same hole reopened on every cycle.
+
+    WHY CHECK (p) CANNOT CATCH THIS, WHICH IS THE WHOLE REASON BOTH CHECKS EXIST. (p) SEEDS a
+    streams.json onto its volume BEFORE mounting it. Under that fixture `[ -e /data/streams.json ]`
+    and `[ -d /data ]` are BOTH true, so (p) passes identically on the correct detection and on the
+    incorrect one — it cannot go red on the regression that has now happened twice. This check
+    removes the seeding, which is the only difference between the two, and that difference is exactly
+    the bug. NEITHER CHECK IS REDUNDANT: (p) is the volume that already holds a configuration and
+    asserts the service reads it rather than an empty list; (q) is the volume that holds nothing yet
+    and asserts the FIRST SAVE lands on it. Deleting either one leaves a silent failure unguarded.
+
+    WHAT IS ASSERTED, AND WHERE. Three rows here — the volume exists and the container boots on it,
+    and the entrypoint SAYS in the log that it fell back to /data (on the file-based detection there
+    is no fallback and therefore no warning at all, so that row alone already goes red). Then the
+    probe makes the service save one stream, and check_empty_legacy_writes_landed() asks the two
+    questions that cannot be asked from inside: `docker diff` for the writable layer, and a read of
+    the volume itself from a throwaway container.
+
+    Returns (rows, ready): `ready` gates the probe, so a probe run against a container that never
+    came up cannot report its own failure to connect as a verdict about where the app is looking.
+    """
+    create_target = "an EMPTY named volume can be created and mounted at {}".format(
+        LEGACY_STATE_DIR)
+    start_target = (
+        "the image starts with an EMPTY volume at {} and NO DATA_DIR, and reaches uvicorn's startup "
+        "markers".format(LEGACY_STATE_DIR))
+    warn_target = (
+        "its log warns that DATA_DIR is unset and names {} as the path it fell back to, on a volume "
+        "that holds no streams.json".format(LEGACY_STATE_DIR))
+
+    # --- create the volume, and DO NOT SEED IT -----------------------------------------------------
+    # The absence of a seeding step is the entire check. Anything written here before the mount would
+    # make this a second copy of (p).
+    status, output = docker(["volume", "create", volume], VOLUME_TIMEOUT)
+    if status is None:
+        return [(create_target, output),
+                (start_target, "not attempted: " + output),
+                (warn_target, "not attempted: " + output)], False
+    if status != 0:
+        reason = "`docker volume create {}` exited {}:\n{}".format(volume, status, excerpt(output))
+        return [(create_target, reason),
+                (start_target, "not attempted: " + reason),
+                (warn_target, "not attempted: " + reason)], False
+    rows = [(create_target, None)]
+
+    # --- start the container the way the old stacks do, on that empty volume -----------------------
+    # No `-e`, no `--env`, no port — this argv IS the claim, exactly as in check_legacy_layout(). The
+    # only difference between the two containers is what is on the volume.
+    remove_container(name)
+    status, output = docker(
+        ["run", "-d", "--name", name, "-v", "{}:{}".format(volume, LEGACY_STATE_DIR), image],
+        START_TIMEOUT)
+    if status is None:
+        rows.append((start_target, output))
+        rows.append((warn_target, "not attempted: " + output))
+        return rows, False
+    if status != 0:
+        reason = "`docker run -d` exited {}:\n{}".format(status, excerpt(output))
+        rows.append((start_target, reason))
+        rows.append((warn_target, "not attempted: " + reason))
+        return rows, False
+
+    log_status, logs = wait_for_markers(name, STARTUP_MARKERS, BOOT_BUDGET)
+    if log_status is None:
+        reason = "`docker logs` produced no exit code — {}".format(logs)
+        rows.append((start_target, reason))
+        rows.append((warn_target, "not attempted: " + reason))
+        return rows, False
+    if log_status != 0:
+        # Same distinction every other log-reading check here makes: on a non-zero exit `logs` holds
+        # docker's complaint rather than the container's output, so searching it for markers would
+        # blame the image for a daemon that would not answer.
+        reason = "`docker logs` exited {}:\n{}".format(log_status, excerpt(logs))
+        rows.append((start_target, reason))
+        rows.append((warn_target, "not attempted: " + reason))
+        return rows, False
+
+    missing = [marker for marker in STARTUP_MARKERS if marker not in logs]
+    if missing:
+        rows.append((start_target, (
+            "it never printed {} within {} s. On an empty volume the entrypoint has to create the "
+            "directory it resolved and chown it before `exec`ing gosu, and a failure in either is an "
+            "exit before the app ever starts — which under `restart: always` is an unbounded restart "
+            "loop rather than a failed deploy.\nLog:\n{}".format(
+                missing, BOOT_BUDGET, excerpt(logs)))))
+        rows.append((warn_target, "not attempted: the container did not finish starting"))
+        return rows, False
+    rows.append((start_target, None))
+
+    absent = [marker for marker in LEGACY_WARN_MARKERS if marker not in logs]
+    rows.append((warn_target, None if not absent else (
+        "the log is missing {}. On a volume that holds no streams.json this is not merely a missing "
+        "courtesy — it is the detection itself reporting that it did NOT recognise the legacy "
+        "layout, so DATA_DIR resolved to {} instead: the container's own writable layer, which the "
+        "next image update discards along with every stream saved into it. A detection that tests "
+        "for {}/streams.json rather than for the {} MOUNT fails exactly here and nowhere else in "
+        "this gate.\nLog:\n{}".format(
+            absent, STATE_DIR, LEGACY_STATE_DIR, LEGACY_STATE_DIR, excerpt(logs)))))
+    return rows, True
+
+
+def check_empty_legacy_writes_landed(image, name, volume, ready):
+    """(q) After the probe has saved a stream: where did it actually go?
+
+    THE DISCRIMINATING HALF OF CHECK (q). The probe's own rows are green on a broken entrypoint and a
+    working one alike — a 200 and a listing prove only that the service round-tripped its own write.
+    These two rows ask the question the service cannot be asked to answer about itself, and they
+    answer it from two sides:
+
+      * `docker diff` reads the container's WRITABLE LAYER. On the file-based detection the save
+        lands in the image's own directory and the diff carries `A /app/data/streams.json` — direct
+        evidence, from the daemon, of the exact failure. On the mount-based one the write goes to the
+        volume, which `docker diff` does not report at all, so nothing under /app/data appears.
+      * the volume is then read back through a THROWAWAY container that mounts it. That is the other
+        half of the same claim: not "the app wrote to the path /data" but "the bytes are on the
+        volume the deployment mounted", which is the only thing that survives the container.
+
+    Both are outer-half by necessity. A process inside the container cannot see its own writable
+    layer as a layer, and reading /data from in there would prove the path rather than the volume.
+
+    Returns (rows, transcripts): the transcripts are the raw `docker diff` output and the read-back
+    container's output, printed with the others so that a red row is readable without a re-run.
+    """
+    diff_target = "nothing was written under {} in the container's writable layer".format(STATE_DIR)
+    volume_target = (
+        "the stream created through the API is really on the volume mounted at {}".format(
+            LEGACY_STATE_DIR))
+    if not ready:
+        reason = "not attempted: the empty-legacy-volume container was not in a state to be probed"
+        return [(diff_target, reason), (volume_target, reason)], []
+
+    rows = []
+    transcripts = []
+
+    # --- the writable layer -----------------------------------------------------------------------
+    status, diff_output = docker(["diff", name], DIFF_TIMEOUT)
+    transcripts.append(("`docker diff` of the empty-legacy-volume container", diff_output))
+    if status is None:
+        rows.append((diff_target, diff_output))
+    elif status != 0:
+        rows.append((diff_target, "`docker diff` exited {}:\n{}".format(
+            status, excerpt(diff_output))))
+    else:
+        # Only paths at or under /app/data are read. The rest of the diff is noise this check has no
+        # opinion about — __pycache__ under /app/src, the /data mount point the daemon had to create
+        # — and matching on the whole diff would make the row fail for reasons that have nothing to
+        # do with where the configuration went.
+        touched = []
+        for line in diff_output.splitlines():
+            _verb, _, path = line.partition(" ")
+            if path == STATE_DIR or path.startswith(STATE_DIR + "/"):
+                touched.append(line.strip())
+        rows.append((diff_target, None if not touched else (
+            "it carries {!r}. This deployment mounted its volume at {} and set no DATA_DIR, so "
+            "{} must never be touched — a write there means the entrypoint did not recognise the "
+            "legacy layout and resolved DATA_DIR to the image's own directory. That directory is "
+            "the container's WRITABLE LAYER (the Dockerfile declares no VOLUME), so the stream an "
+            "operator just saved through the UI is destroyed by the next automatic image update, "
+            "with every endpoint answering 200 and the healthcheck green the whole time".format(
+                touched, LEGACY_STATE_DIR, STATE_DIR))))
+
+    # --- the volume itself ------------------------------------------------------------------------
+    # Read through a throwaway container of the image under test, with `--entrypoint python` so that
+    # nothing about the entrypoint being checked can influence the answer. Only the stream NAMES are
+    # printed and never the file: streams.json is the one file in this service that holds MQTT and
+    # InfluxDB credentials, and a gate that dumps it into a CI log is a habit worth not forming, even
+    # on a synthetic stream.
+    read_program = (
+        "import json\n"
+        "import os\n"
+        "DIRECTORY = {directory!r}\n"
+        "PATH = os.path.join(DIRECTORY, 'streams.json')\n"
+        "try:\n"
+        "    listed = sorted(os.listdir(DIRECTORY))\n"
+        "except Exception as error:\n"
+        "    print('UNLISTABLE ' + type(error).__name__ + ': ' + str(error))\n"
+        "    raise SystemExit(0)\n"
+        "print('LISTING ' + json.dumps(listed))\n"
+        "if not os.path.exists(PATH):\n"
+        "    print('NO-FILE')\n"
+        "    raise SystemExit(0)\n"
+        "try:\n"
+        "    with open(PATH) as handle:\n"
+        "        loaded = json.load(handle)\n"
+        "except Exception as error:\n"
+        "    print('UNREADABLE ' + type(error).__name__ + ': ' + str(error))\n"
+        "    raise SystemExit(0)\n"
+        "names = [entry.get('name') for entry in loaded] if isinstance(loaded, list) else None\n"
+        "print('NAMES ' + json.dumps(names))\n"
+    ).format(directory=LEGACY_STATE_DIR)
+
+    # NAMED even though it is `--rm`: see READBACK_SUFFIX. This is the container that matters most
+    # for cleanup — it mounts the named volume, so one left behind by a killed client would also make
+    # the remove_volume() in main()'s `finally` fail and leak the volume too.
+    remove_container(name + READBACK_SUFFIX)
+    status, read_output = docker(
+        ["run", "--rm", "--name", name + READBACK_SUFFIX,
+         "-v", "{}:{}".format(volume, LEGACY_STATE_DIR),
+         "--entrypoint", "python", image, "-c", read_program],
+        READBACK_TIMEOUT)
+    transcripts.append(
+        ("the volume mounted at {}, read back from a throwaway container".format(LEGACY_STATE_DIR),
+         read_output))
+    if status is None:
+        rows.append((volume_target, read_output))
+        return rows, transcripts
+    if status != 0:
+        rows.append((volume_target, "reading the volume back exited {}:\n{}".format(
+            status, excerpt(read_output))))
+        return rows, transcripts
+
+    names_line = next(
+        (line for line in read_output.splitlines() if line.startswith("NAMES ")), None)
+    if names_line is None:
+        rows.append((volume_target, (
+            "the volume holds no usable streams.json after a save the API reported as successful. "
+            "The read-back container said:\n{}\nA `NO-FILE` there is the finding itself: the "
+            "configuration went into the container's writable layer at {} instead, where the next "
+            "image update deletes it — and the operator who saved it has a 200, a populated UI and "
+            "no way to know".format(excerpt(read_output), STATE_DIR))))
+        return rows, transcripts
+    try:
+        names = json.loads(names_line[len("NAMES "):])
+    except Exception as error:
+        rows.append((volume_target, (
+            "the read-back container's NAMES line is not JSON ({}): {}".format(
+                type(error).__name__, names_line[:400]))))
+        return rows, transcripts
+    if isinstance(names, list) and EMPTY_LEGACY_STREAM_NAME in names:
+        rows.append((volume_target, None))
+        return rows, transcripts
+    rows.append((volume_target, (
+        "the file on the volume holds streams named {!r}, and {!r} — the one the API accepted and "
+        "then listed back — is not among them. What the service saved is not on the volume the "
+        "deployment mounted, so it does not survive the next image update".format(
+            names, EMPTY_LEGACY_STREAM_NAME))))
+    return rows, transcripts
 
 
 def check_final_log(name, started):
@@ -1460,14 +2485,14 @@ def main():
         # everything else has had its turn at it. Also BEFORE the restart below — see its docstring.
         rows.extend(check_container_alive(name + SERVE_SUFFIX, serve_started))
 
-        # The container is deliberately damaged from here on: /data goes back to root and the
+        # The container is deliberately damaged from here on: /app/data goes back to root and the
         # container is restarted onto it, so nothing above this line could have run afterwards.
         repair_rows, repair_ready = check_volume_repair(name + SERVE_SUFFIX, serve_started)
         rows.extend(repair_rows)
 
         # The GID is spelled out as well as the uid, and not out of symmetry: `docker exec -u 1000`
         # on its own leaves the group at 0, which is not the pair `gosu app` hands the serving
-        # process — and a /data that was group-writable rather than owner-writable would then be
+        # process — and an /app/data that was group-writable rather than owner-writable would then be
         # judged against a group the service never has. Numeric on both sides rather than `-u app`,
         # so that an /etc/passwd in which `app` had quietly become uid 0 could not answer this
         # probe's question as root.
@@ -1483,18 +2508,80 @@ def main():
         # steps that do not: the final log and the cleanup both work on a stopped container.
         rows.extend(check_sigterm_shutdown(name + SERVE_SUFFIX, serve_started))
 
-        # LAST, and that is the reason it exists: the log the container has at this point covers the
-        # whole run rather than the snapshot the boot wait returned.
+        # LAST of everything about the -serve container, and that is the reason it exists: the log
+        # it has at this point covers the whole run rather than the snapshot the boot wait returned.
         final_rows, final_logs = check_final_log(name + SERVE_SUFFIX, serve_started)
         rows.extend(final_rows)
         transcripts.append(("the serving container", final_logs))
+
+        # (p) A SECOND container, in the shape the older deployments really have. Placed after
+        # everything above so that the -serve container's story is complete and uninterrupted in the
+        # report; it shares nothing with it — its own name, its own volume, its own probe.
+        legacy_rows, legacy_ready = check_legacy_layout(
+            image, name + LEGACY_SUFFIX, name + LEGACY_VOLUME_SUFFIX)
+        rows.extend(legacy_rows)
+
+        legacy_probe_rows, legacy_probe_output = run_probe(
+            name + LEGACY_SUFFIX, legacy_ready,
+            LEGACY_PROBE
+            .replace("@@STREAM_ID@@", LEGACY_STREAM["id"])
+            .replace("@@STREAM_NAME@@", LEGACY_STREAM["name"]),
+            LEGACY_PROBE_TIMEOUT, LEGACY_PROBE_MARKER, EXPECTED_LEGACY_PROBE_TARGETS,
+            LEGACY_PROBE_ROW_PREFIX, "legacy-layout")
+        transcripts.append(
+            ("the legacy-layout probe, from inside the second container", legacy_probe_output))
+        rows.extend(legacy_probe_rows)
+
+        legacy_log_status, legacy_logs = docker(
+            ["logs", name + LEGACY_SUFFIX], LOGS_TIMEOUT)
+        transcripts.append((
+            "the legacy-layout container",
+            legacy_logs if legacy_log_status == 0 else ""))
+
+        # (q) A THIRD container, in that same older shape but on a volume that holds nothing yet —
+        # the one case (p) above cannot reach, because (p) seeds its volume before mounting it and is
+        # therefore satisfied by a detection that looks at the legacy FILE just as readily as by one
+        # that looks at the legacy MOUNT. Its own name, its own volume, its own probe; it shares
+        # nothing with either container above.
+        empty_legacy_rows, empty_legacy_ready = check_empty_legacy_layout(
+            image, name + EMPTY_LEGACY_SUFFIX, name + EMPTY_LEGACY_VOLUME_SUFFIX)
+        rows.extend(empty_legacy_rows)
+
+        empty_legacy_probe_rows, empty_legacy_probe_output = run_probe(
+            name + EMPTY_LEGACY_SUFFIX, empty_legacy_ready,
+            EMPTY_LEGACY_PROBE.replace("@@STREAM_NAME@@", EMPTY_LEGACY_STREAM_NAME),
+            EMPTY_LEGACY_PROBE_TIMEOUT, EMPTY_LEGACY_PROBE_MARKER,
+            EXPECTED_EMPTY_LEGACY_PROBE_TARGETS, EMPTY_LEGACY_PROBE_ROW_PREFIX,
+            "empty-legacy-volume")
+        transcripts.append(
+            ("the empty-legacy-volume probe, from inside the third container",
+             empty_legacy_probe_output))
+        rows.extend(empty_legacy_probe_rows)
+
+        # AFTER that probe, necessarily: it is the probe that makes the service save something, and
+        # these two rows are the ones that ask where the save went.
+        landed_rows, landed_transcripts = check_empty_legacy_writes_landed(
+            image, name + EMPTY_LEGACY_SUFFIX, name + EMPTY_LEGACY_VOLUME_SUFFIX,
+            empty_legacy_ready)
+        rows.extend(landed_rows)
+        transcripts.extend(landed_transcripts)
+
+        empty_legacy_log_status, empty_legacy_logs = docker(
+            ["logs", name + EMPTY_LEGACY_SUFFIX], LOGS_TIMEOUT)
+        transcripts.append((
+            "the empty-legacy-volume container",
+            empty_legacy_logs if empty_legacy_log_status == 0 else ""))
     finally:
         # Unconditionally. When a bound fires inside docker() it kills the docker CLIENT on the
         # runner, not the container on the daemon, so a hung run would otherwise sit here pinning
-        # the image until somebody noticed. The workflow removes the same name again under
+        # the image until somebody noticed. The workflow removes the same names again under
         # `if: always()`, which covers this whole script being killed by the step timeout.
         for suffix in ALL_SUFFIXES:
             remove_container(name + suffix)
+        # AFTER the containers, never before: the daemon refuses to remove a volume that is still
+        # mounted by one, and each of these is mounted by a container removed in the loop above.
+        for suffix in ALL_VOLUME_SUFFIXES:
+            remove_volume(name + suffix)
 
     # The transcripts first, the verdicts last: in a CI log the verdicts are what somebody scrolls to
     # the bottom for, and the containers' own output is what turns a one-line verdict into a
