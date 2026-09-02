@@ -5,7 +5,6 @@
 import asyncio
 import json
 import logging
-import os
 import time
 from contextlib import suppress
 from typing import Callable, Optional
@@ -14,16 +13,24 @@ import aiomqtt
 
 from .influx_writer import contains_excluded, flatten_payload, resolve_value_precision, InfluxWriter
 from .config import StreamConfig
+from .config_errors import load_settings_or_exit
+from .settings import Settings
 
 logger = logging.getLogger(__name__)
 
 
+# A FRESH Settings() per call rather than the module-level `settings` singleton, and that is what
+# keeps the two mechanisms below honest. The constants are assigned from these readers at import,
+# and tests/test_mqtt_processor.py's `reimport` fixture proves that wiring by reloading THIS module
+# with a different environment — a reload that does not re-execute src/settings.py, so a reader
+# closing over the singleton would answer with the environment of the first import forever and the
+# test would be checking nothing.
 def batch_size_from_env() -> int:
-    return int(os.environ.get("BATCH_SIZE", "100"))
+    return load_settings_or_exit(Settings).batch_size
 
 
 def batch_interval_from_env() -> float:
-    return float(os.environ.get("BATCH_INTERVAL", "1.0"))
+    return load_settings_or_exit(Settings).batch_interval
 
 
 # Read once, at import. Through a function rather than inline so that "this value comes from the

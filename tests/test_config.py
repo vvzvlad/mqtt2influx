@@ -7,7 +7,7 @@ to write InfluxDB to lives in one JSON file under DATA_DIR, and in production th
 docker volume that survives image updates. A bug here does not corrupt one request, it silently
 empties the configuration of every stream.
 
-Every test runs against a temporary DATA_DIR (see conftest.py) — nothing here touches /data.
+Every test runs against a temporary DATA_DIR (see conftest.py) — nothing here touches /app/data.
 """
 
 import json

@@ -27,3 +27,13 @@ websockets==16.0
 
 aiomqtt==2.5.1
 aiohttp==3.13.5
+
+# src/settings.py — the one typed place every environment variable this service reads is declared.
+# `pydantic` is named explicitly even though fastapi already pulls it in: settings.py imports it
+# directly (through pydantic-settings and, in src/config_errors.py, `from pydantic import
+# ValidationError`), so it is a DIRECT dependency here and pinning it through fastapi's resolution
+# would let a fastapi bump move it. pydantic-settings brings python-dotenv with it, which is what
+# reads the .env file named in SettingsConfigDict — there is no .env in the image (.dockerignore
+# keeps it out), so in production every value still arrives from the real environment.
+pydantic==2.13.5
+pydantic-settings==2.15.0

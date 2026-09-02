@@ -8,7 +8,7 @@ repeated in each test file.
 at import, into a module-level name, and `_config_path()` looks that name up on every call — so
 rebinding `src.config.DATA_DIR` redirects every read and write, including the ones reached through
 `src.api`, which imported the CRUD helpers by reference. Without the redirect the suite would default
-to `/data`: the production path, and on a developer's machine a directory it may well be able to
+to `/app/data`: the production path, and on a developer's machine a directory it may well be able to
 create.
 
 **Nothing opens a socket.** `src/stream_manager.py` exposes a module-level singleton `manager`, and
@@ -26,7 +26,31 @@ real manager rather than about a stub.
 import pytest
 
 from src import config
+from src.settings import Settings
 from src.stream_manager import manager
+
+
+@pytest.fixture(autouse=True)
+def no_dotenv(monkeypatch):
+    """Keep a developer's own .env out of the suite.
+
+    `src/settings.py` names `.env` in its `SettingsConfigDict`, and that path is RELATIVE — it
+    resolves against the working directory, which for `make test` is the repository root, which is
+    exactly where `make env` puts the file. `src/mqtt_processor.py` builds a FRESH `Settings()` on
+    every call rather than reusing the module-level singleton, so the file would be re-read during
+    the run and not merely at import.
+
+    The result without this fixture is a suite whose answers depend on an untracked file: a
+    developer with `BATCH_SIZE=220` in their .env fails
+    `test_the_module_constants_fall_back_to_the_documented_defaults`, which unsets the variable
+    precisely to observe the DEFAULT, and CI — where no .env exists — passes. Tests have to be a
+    statement about the code, not about the machine.
+
+    Autouse, and it edits `model_config` rather than deleting the file, because the point is that
+    every test in the suite is unaffected by whatever happens to be on disk. A real environment
+    variable still wins over the file in production; that precedence is untouched here.
+    """
+    monkeypatch.setitem(Settings.model_config, "env_file", None)
 
 
 @pytest.fixture

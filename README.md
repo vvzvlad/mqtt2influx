@@ -23,8 +23,8 @@ make install                       # creates .venv, installs pinned deps + pytes
 DATA_DIR=./data make run           # http://127.0.0.1:8000
 ```
 
-`DATA_DIR` defaults to `/data`, which is right inside the container and wrong on a workstation —
-set it to something local, as above.
+`DATA_DIR` defaults to `/app/data`, which is right inside the container and wrong on a workstation
+— set it to something local, as above, or put it in `.env` (`make env`), which is read at startup.
 
 Other options:
 
@@ -32,8 +32,13 @@ Other options:
 .venv/bin/python main.py --host 127.0.0.1 --port 8000 --reload
 ```
 
-`PORT` works as an environment variable too. `BATCH_SIZE` (default 100) and `BATCH_INTERVAL`
-(default 1.0 s) bound the write batch: a flush happens when either is reached.
+`PORT` works as an environment variable too, though an explicit `--port` still wins over it.
+`BATCH_SIZE` (default 100) and `BATCH_INTERVAL` (default 1.0 s) bound the write batch: a flush
+happens when either is reached.
+
+All four are declared in `src/settings.py` (pydantic-settings) and read from the environment or from
+a `.env` beside the project — see `.env.example`, which is the one place the whole environment
+surface is written down.
 
 ## Configuration
 
@@ -83,9 +88,32 @@ that emptiness to disk. A stream that never sets `value_precision` never gets th
 stream that does set it makes the whole file unreadable to a build that predates the field. **If
 you ever roll back past this feature, delete the `value_precision` keys from `streams.json` first.**
 
-In production `/data` is a docker volume named `mqtt2influx_data`. **That volume is the entire
-configuration of the service**: lose it and every stream is gone. See the comment above the
-`volumes:` block in `docker-compose.yml` before changing anything about how it is declared.
+In production the state directory is a docker volume named `mqtt2influx_data`. **That volume is the
+entire configuration of the service**: lose it and every stream is gone. See the comment above the
+`volumes:` block in `docker-compose.yml` before changing anything about how it is declared — in
+particular, `DATA_DIR` and the mount point are two halves of one fact and have to move together, in
+a single stack update.
+
+Where it is MOUNTED depends on how old the deployment is, and the image copes with both without
+being told:
+
+- mounted at `/app/data` (with `DATA_DIR` set to match, or left to the default) — the current shape;
+- mounted at `/data` with no environment variables at all — the older stacks. The image declares no
+  `ENV DATA_DIR`, precisely so that "nothing was chosen" stays visible inside the container:
+  `entrypoint.sh` then falls back to `/data` when there is no `streams.json` at `/app/data` **and
+  `/data` exists as a directory** (`[ -d /data ]`), and logs a warning saying the deployment should
+  set `DATA_DIR` explicitly.
+
+  **The signal is the MOUNT, not a file on it, and that distinction is the whole fix.** This image
+  never creates `/data`, so the directory being there at all is what says a volume was bound there.
+  A test for the legacy *file* (`[ -e /data/streams.json ]`) looks equivalent and is not: a
+  legacy-shaped stack whose volume holds no `streams.json` **yet** — one just created, one restored
+  empty, one whose operator has not saved a stream since the migration — fails it, comes up on
+  `/app/data`, and writes the operator's first stream into the container's writable layer, where the
+  next automatic image update deletes it. Everything answers 200 and the healthcheck stays green
+  throughout. That regression has shipped twice, `ci/smoke.py` check (q) exists to catch the third,
+  and `[ -d /data ]` is therefore not a redundant widening to be "simplified" away. Setting
+  `DATA_DIR` is still the right thing to do — the fallback is a safety net, not a configuration.
 
 ## HTTP API
 
@@ -107,6 +135,8 @@ catch-all.
 
 ```text
 main.py              argparse + uvicorn.run("src.api:app")
+src/settings.py      every environment variable this service reads, typed, with defaults
+src/config_errors.py turns a settings ValidationError into a readable startup message
 src/config.py        StreamConfig + CRUD over {DATA_DIR}/streams.json
 src/api.py           REST, /ws, the static mount
 src/stream_manager.py  the `manager` singleton owning the running processors
@@ -127,7 +157,7 @@ They are not optional. Both CI workflows run the suite inside `python:3.11-slim`
 image is built from — before anything is built, and a red suite stops the pipeline there.
 
 The suite runs against a temporary `DATA_DIR` and a stubbed stream manager, so it never touches
-`/data` and never opens a socket.
+`/app/data` and never opens a socket.
 
 ## Deployment
 

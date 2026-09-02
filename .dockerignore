@@ -8,8 +8,17 @@
 # anyway. That is precisely why this file has to exist: the day someone writes `COPY . .` — the
 # single most common edit a Dockerfile ever receives — this is what keeps the git history, the
 # developer's local .venv, the runtime data/ directory and the CI machinery out of a published
-# image. ci/smoke.py asserts the absence of .venv, .git, data/ and tests/ inside the built artefact,
-# so the guarantee is checked rather than assumed.
+# image.
+#
+# PART of that is checked rather than assumed, and it is worth knowing exactly which part.
+# ci/smoke.py's in-image probe asserts that /app/.venv, /app/.git, /app/tests and /app/ci are
+# ABSENT from the built artefact, and that /app/data is EMPTY — emptiness and not absence, because
+# the Dockerfile creates that directory deliberately so a mounted volume inherits its ownership.
+# `.env` is NOT on that list, and leaving it off is the deliberate choice: the file is gitignored
+# and only `make env` creates it, so the CI checkout the gate runs against never has one and such a
+# row would pass without ever having been able to fail. What actually keeps a developer's `.env`
+# out of a published image is the three explicit COPY lines above — and this file, on the day
+# somebody replaces them with `COPY . .`.
 
 # Version control and CI machinery: never needed at runtime, and .git in particular carries the
 # whole history of the repository into a public registry image.
@@ -29,9 +38,17 @@ __pycache__/
 .pytest_cache/
 
 # Runtime state. `data/` exists on a workstation and holds a developer's real streams.json —
-# including MQTT and InfluxDB passwords. It must never be baked into an image; in production /data
-# is a docker volume mounted at run time (see docker-compose.yml).
+# including MQTT and InfluxDB passwords. It must never be baked into an image; in production the
+# state directory is a docker volume mounted at run time (see docker-compose.yml).
 data/
+
+# The developer's own environment, created by `make env`. src/settings.py names `.env` in its
+# SettingsConfigDict, so pydantic-settings reads it wherever it finds one. A real environment
+# variable still wins over the file — but every variable the deployment does NOT set would then come
+# from a workstation's copy instead of from the defaults in src/settings.py, and `.env.example` ships
+# `DATA_DIR=./data`. Baked in at /app/.env that is a container writing its whole configuration to a
+# relative path in the image's writable layer, which the next update deletes.
+.env
 
 # Tests and their fixtures are run in CI from the source tree, not from the image.
 tests/
