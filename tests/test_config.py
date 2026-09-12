@@ -188,6 +188,76 @@ def test_the_field_defaults_to_unset_on_a_bare_stream_config():
     assert make_stream().value_precision is None
 
 
+# ── write_strings: a second optional field, under the same rollback rule ──────────────────────────
+#
+# `value_precision` leaves itself out of the file when it is unset for one reason only: an older
+# image reading a key it does not declare answers `[]` — EVERY stream gone — and the next save
+# makes that permanent. A bool cannot be "unset", so the equivalent of an absent key here is the
+# default, false. Written out on every record it would poison the file for an older build over a
+# setting nobody turned on.
+
+def test_a_streams_json_written_before_write_strings_existed_still_loads(data_dir):
+    """The upgrade direction: the file on the production volume has no such key."""
+    data_dir.mkdir(parents=True)
+    record = {
+        "id": "wirenboard", "name": "wb", "mqtt_host": "10.0.0.1", "mqtt_port": 1883,
+        "mqtt_user": "", "mqtt_password": "", "mqtt_topic": "/devices/#", "topic_prefix": "",
+        "influx_host": "10.0.0.2", "influx_port": 8086, "influx_user": "", "influx_password": "",
+        "influx_database": "metrics", "enabled": False,
+    }
+    (data_dir / "streams.json").write_text(json.dumps([record]))
+
+    loaded = load_streams()
+
+    assert len(loaded) == 1
+    assert loaded[0].write_strings is False
+
+
+def test_a_stream_that_never_turned_write_strings_on_writes_no_such_key(data_dir):
+    """The rollback direction, and the reason `_serialize` tests the value rather than asdict()ing.
+
+    A `write_strings: false` on every record would make the whole file unreadable to an image that
+    predates the field — not one bad record, `[]` — for a feature none of those streams uses.
+    """
+    upsert_stream(make_stream(name="untouched"))
+
+    raw = json.loads((data_dir / "streams.json").read_text())
+
+    assert len(raw) == 1
+    assert "write_strings" not in raw[0]
+    # And the rest of the record is exactly the shape it has always been.
+    assert raw[0]["name"] == "untouched"
+    assert raw[0]["influx_database"] == "metrics"
+
+
+def test_write_strings_is_written_and_survives_a_round_trip(data_dir):
+    """A stream that does opt in carries the key, and reads back as the same stream."""
+    upsert_stream(make_stream(name="printer", write_strings=True))
+
+    raw = json.loads((data_dir / "streams.json").read_text())
+    assert raw[0]["write_strings"] is True
+    assert load_streams()[0].write_strings is True
+
+
+def test_turning_write_strings_off_again_removes_the_key(data_dir):
+    """Opting in must not be a one-way door out of the shape an older image can read."""
+    stream = make_stream(name="printer", write_strings=True)
+    upsert_stream(stream)
+    assert "write_strings" in json.loads((data_dir / "streams.json").read_text())[0]
+
+    stream.write_strings = False
+    upsert_stream(stream)
+
+    assert "write_strings" not in json.loads((data_dir / "streams.json").read_text())[0]
+    assert load_streams()[0].write_strings is False
+
+
+def test_write_strings_defaults_to_off_on_a_bare_stream_config():
+    """A stream created through the API without mentioning it must not opt itself in."""
+    assert StreamConfig().write_strings is False
+    assert make_stream().write_strings is False
+
+
 # ── the CRUD cycle ────────────────────────────────────────────────────────────────────────────────
 
 def test_create_read_update_delete_cycle(data_dir):

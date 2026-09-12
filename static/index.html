@@ -218,6 +218,10 @@
         <label>Value Precision — decimals (empty = 2, -1 = store as received)</label>
         <input type="number" id="fValuePrecision" step="1" min="-1" placeholder="2">
       </div>
+      <div class="form-group full">
+        <label><input type="checkbox" id="fWriteStrings"> Write string values (e.g. "Printing")</label>
+        <label>Off by default. InfluxDB fixes a field's type on the first write, so on a topic that also sends numbers the whole batch is rejected</label>
+      </div>
     </div>
     <div class="modal-footer">
       <button class="btn btn-ghost" onclick="closeModal()">Cancel</button>
@@ -312,7 +316,11 @@ function appendLogEntryDOM(body, entry) {
   div.className = 'log-entry';
   const ts = new Date(entry.ts);
   const hms = ts.toTimeString().slice(0,8) + '.' + String(ts.getMilliseconds()).padStart(3,'0');
-  div.innerHTML = `<span class="log-ts">${hms}</span><span class="log-topic" title="${escHtml(entry.topic)}">${escHtml(entry.topic)}</span><span class="log-value">${entry.value}</span>`;
+  // The value goes through escHtml() exactly like the topic beside it. It used to be interpolated
+  // raw, which read the same for as long as every value was a number; with write_strings the value
+  // is whatever was published to the broker, and a status spelled `<idle>` would be parsed as a tag
+  // and vanish from the log — the new setting looking broken on the one screen that shows it works.
+  div.innerHTML = `<span class="log-ts">${hms}</span><span class="log-topic" title="${escHtml(entry.topic)}">${escHtml(entry.topic)}</span><span class="log-value">${escHtml(entry.value)}</span>`;
   body.appendChild(div);
   while (body.children.length > DOM_MAX_LOG) body.removeChild(body.firstChild);
 }
@@ -452,6 +460,11 @@ function openModal(prefill) {
   // ?? and not ||, because 0 is a legitimate precision (round to whole numbers) and || would
   // blank the box for it, so saving an untouched form would silently reset the stream to 2.
   document.getElementById('fValuePrecision').value = f.value_precision ?? '';
+  // !! only turns the missing key of an older record into an explicit false; `.checked = undefined`
+  // would work by accident. It is NOT a guard against a hand-edited string in streams.json — a
+  // ticked box is the honest reading of one, because the processor resolves the same field with
+  // bool(), and bool("false") is True there too. Through the API such a value never gets in: 422.
+  document.getElementById('fWriteStrings').checked = !!f.write_strings;
   document.getElementById('overlay').classList.add('open');
 }
 
@@ -513,6 +526,9 @@ async function saveStream() {
     // or rewritten, this is what still sends null instead of quietly rounding the whole stream to
     // whole numbers. isFinite is the cheap catch-all for NaN and the infinities.
     value_precision: precisionRaw === '' || !Number.isFinite(valuePrecision) ? null : valuePrecision,
+    // `.checked` is already a real boolean, which is what the API insists on: it answers anything
+    // else with 422 rather than reading a truthy string as a yes.
+    write_strings: document.getElementById('fWriteStrings').checked,
     enabled: true,
   };
 

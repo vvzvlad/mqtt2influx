@@ -5,7 +5,7 @@
 import logging
 import math
 import time
-from typing import List, Optional, Tuple
+from typing import List, Optional, Tuple, Union
 import aiohttp
 
 logger = logging.getLogger(__name__)
@@ -147,21 +147,64 @@ def to_number(value, precision: Optional[int] = DEFAULT_VALUE_PRECISION):
     return None
 
 
-def flatten_payload(topic: str, payload, precision: Optional[int] = DEFAULT_VALUE_PRECISION):
+def _is_a_number_we_refused(text: str) -> bool:
+    """True when float() reads this string as a number — i.e. to_number() dropped a NUMBER, not a word.
+
+    The difference decides whether `write_strings` may pick a value up. `to_number()` answers None
+    for two unrelated reasons: the payload is not a number at all ("Printing"), or it IS one and
+    `_to_storable_float()` threw it away as unstorable — "nan" and "inf", which a sensor with no
+    reading really does publish, and "1e400" or four hundred digits, which overflow to an infinity.
+    Those live on topics that carry floats the rest of the time, so writing them as string fields
+    would put a string into a field InfluxDB has already typed as a float: a 400 that costs the
+    entire batch of 220 points, classed permanent, with no retry. The drop is older than this
+    setting and stays.
+
+    float() of a STRING never raises OverflowError — it returns inf for a number too large — so
+    ValueError is the whole of what has to be caught here. _to_storable_float() also guards a second
+    source, round() with a negative ndigits, which a string CAN reach; it needs no handling here,
+    because such a payload is by definition one float() reads, so the answer is True either way.
+    """
+    try:
+        float(text)
+    except ValueError:
+        return False
+    return True
+
+
+def flatten_payload(topic: str, payload, precision: Optional[int] = DEFAULT_VALUE_PRECISION,
+                    write_strings: bool = False):
     """Recursively expand JSON objects into flat topic/value pairs."""
     if isinstance(payload, dict):
         suffix = "" if topic.endswith("/") else "/"
         for key, val in payload.items():
             if not key.startswith("_"):
-                yield from flatten_payload(f"{topic}{suffix}{key}", val, precision)
+                yield from flatten_payload(f"{topic}{suffix}{key}", val, precision, write_strings)
     else:
         num = to_number(payload, precision)
         if num is not None:
             clean_topic = topic.replace(" ", "_").lower()
             yield clean_topic, num
+        elif write_strings and isinstance(payload, str) and payload and not _is_a_number_we_refused(payload):
+            # Strictly the leftovers: this branch only ever sees a value to_number() has ALREADY
+            # refused, so a number, a numeric string and the "true"/"false" → 10/0 mapping keep
+            # writing exactly what they wrote yesterday whether the flag is on or off. Turning it on
+            # can add series, never change one — which is why the numbers to_number() refused as
+            # UNSTORABLE ("nan", "inf", an overflowing literal) are excluded here rather than
+            # stringified: see _is_a_number_we_refused() above.
+            #
+            # The VALUE is kept verbatim — only the topic is lowercased and space-stripped, as it has
+            # always been. "Printing" and "printing" are different states of a 3D printer, and this
+            # is a field value, not a measurement name: nothing downstream needs it normalised, and
+            # normalising it would silently merge two states into one in every dashboard.
+            #
+            # An empty string stays dropped, and that is not tidiness: clearing a retained topic is
+            # published as a zero-length payload, so writing it would turn every "this reading no
+            # longer exists" into a data point saying the state is "".
+            clean_topic = topic.replace(" ", "_").lower()
+            yield clean_topic, payload
 
 
-def make_line(measurement: str, value: float, timestamp_ms: int) -> str:
+def make_line(measurement: str, value: Union[float, str], timestamp_ms: int) -> str:
     # The backslash is replaced FIRST: doing it after the others would go back over the backslashes
     # they just inserted and escape those too, turning `a,b` into `a\\,b` — an escaped backslash
     # followed by a bare comma, which is the field separator again.
@@ -177,6 +220,26 @@ def make_line(measurement: str, value: float, timestamp_ms: int) -> str:
         .replace("\n", "\\n")
         .replace("\r", "\\r")
     )
+    if isinstance(value, str):
+        # A string field is quoted, and inside the quotes line protocol escapes exactly two
+        # characters: the backslash and the double quote. Backslash FIRST for the same reason as
+        # above — escaping it afterwards would double the backslashes the quote rule just inserted
+        # and leave the quote unescaped again, closing the field early.
+        # The newline and the carriage return are the injection half, and they are the same hazard
+        # the measurement escaping already documents: write_batch joins the batch with "\n", so a
+        # raw newline inside a field value ends the record and makes everything after it a NEW
+        # line-protocol record — a write into any measurement whoever published the payload likes.
+        # A payload is attacker-supplied by construction.
+        # Note what that costs: InfluxDB reads only \\ and \" back inside a string field, so a value
+        # carrying a real newline is stored with the two characters `\n` in its place. Everything
+        # else survives byte for byte; a multi-line payload does not.
+        safe_value = (
+            value.replace("\\", "\\\\")
+            .replace('"', '\\"')
+            .replace("\n", "\\n")
+            .replace("\r", "\\r")
+        )
+        return f'{safe} value="{safe_value}" {timestamp_ms}'
     return f"{safe} value={value} {timestamp_ms}"
 
 

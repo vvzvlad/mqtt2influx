@@ -492,6 +492,60 @@ async def test_a_stream_that_configures_nothing_still_batches_two_decimals(monke
     ]
 
 
+# --- the stream's write_strings flag, from streams.json to the batched point ----------------------
+#
+# The same wiring problem as the precision above, and a worse failure mode: every default along the
+# chain is "off", so a processor that never passed `cfg.write_strings` on to `flatten_payload` would
+# drop status strings exactly as it always has — a stream with the box ticked, saved, restarted and
+# reported healthy, writing nothing. Nothing in the unit tests of `flatten_payload` can see that.
+
+async def test_a_stream_with_write_strings_on_batches_a_status_string(monkeypatch):
+    """The printer stream, end to end: "Printing" reaches the writer instead of being dropped."""
+    monkeypatch.setattr(mqtt_processor, "BATCH_SIZE", 1)
+    queue = asyncio.Queue()
+    install_fake_client(monkeypatch, queue)
+
+    proc = make_processor(write_strings=True)
+    writer = FakeWriter()
+    proc._running = True
+    task = asyncio.create_task(proc._connect_and_process(writer))
+    queue.put_nowait(FakeMessage("data/gcode/status", "Printing"))
+
+    try:
+        assert await eventually(lambda: writer.calls), "the batch never reached the writer"
+    finally:
+        await _stop(proc, task)
+
+    assert [(topic, value) for topic, value, _ts in writer.calls[0]] == [
+        ("data/gcode/status", "Printing"),
+    ]
+
+
+async def test_a_stream_that_leaves_the_flag_off_still_drops_a_status_string(monkeypatch):
+    """The shape every production stream is in today — the message is received and writes nothing."""
+    monkeypatch.setattr(mqtt_processor, "BATCH_SIZE", 1)
+    queue = asyncio.Queue()
+    install_fake_client(monkeypatch, queue)
+
+    proc = make_processor()
+    writer = FakeWriter()
+    proc._running = True
+    task = asyncio.create_task(proc._connect_and_process(writer))
+    queue.put_nowait(FakeMessage("data/gcode/status", "Printing"))
+    # A message that DOES produce a point, published after it, so the assertion below waits for real
+    # work to finish rather than for a timeout: if the status string were batched it would be here.
+    queue.put_nowait(FakeMessage("data/gcode/progress", "42"))
+
+    try:
+        assert await eventually(lambda: writer.calls), "the batch never reached the writer"
+    finally:
+        await _stop(proc, task)
+
+    assert [(topic, value) for call in writer.calls for topic, value, _ts in call] == [
+        ("data/gcode/progress", 42.0),
+    ]
+
+
 # --- bug 3: the dead auth placeholder ------------------------------------------------------------
 
 async def test_credentials_reach_the_client_and_nothing_else_pretends_to_carry_them(monkeypatch):

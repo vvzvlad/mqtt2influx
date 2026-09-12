@@ -71,6 +71,30 @@ def _validate_value_precision(body: dict):
                        DEFAULT_VALUE_PRECISION, value))
 
 
+def _validate_write_strings(body: dict):
+    """Refuse a `write_strings` that is not a real bool, at the edge, before anything is stored.
+
+    `StreamConfig(**body)` checks no types at all and the processor resolves this field with
+    `bool(...)`, so every truthy non-bool is a silent yes: `"write_strings": "false"` — the obvious
+    spelling from a shell script or a hand-edited body — is a non-empty string and would switch a
+    production stream into writing string fields while the config, the GET and the UI checkbox all
+    read "false". InfluxDB fixes a field's type on the first write, so that mistake is not a
+    cosmetic one: the first string into a field that holds numbers makes the database refuse the
+    whole batch it arrived in.
+
+    An absent key is fine and means the default (off) — the same shape as `value_precision` above,
+    and what a curl one-liner that predates this feature sends.
+    """
+    if "write_strings" not in body:
+        return
+    value = body["write_strings"]
+    if not isinstance(value, bool):
+        raise HTTPException(
+            status_code=422,
+            detail="write_strings must be true or false (omit it for the default, false); "
+                   "got {!r}".format(value))
+
+
 @app.get("/api/streams")
 async def list_streams():
     streams = load_streams()
@@ -86,6 +110,7 @@ async def list_streams():
 async def create_stream(body: dict):
     body.pop("id", None)
     _validate_value_precision(body)
+    _validate_write_strings(body)
     stream = StreamConfig(**{k: v for k, v in body.items() if hasattr(StreamConfig, k) or k in StreamConfig.__dataclass_fields__})
     upsert_stream(stream)
     if stream.enabled:
@@ -101,6 +126,7 @@ async def update_stream(stream_id: str, body: dict):
     # Before upsert_stream() and before restart_stream(): a refused request must leave both the file
     # and the running processor exactly as they were.
     _validate_value_precision(body)
+    _validate_write_strings(body)
     body["id"] = stream_id
     fields = StreamConfig.__dataclass_fields__
     updated = StreamConfig(**{k: body.get(k, getattr(existing, k)) for k in fields})

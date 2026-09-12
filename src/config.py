@@ -39,6 +39,11 @@ class StreamConfig:
     # See DEFAULT_VALUE_PRECISION / RAW_VALUE_PRECISION in influx_writer.py for why the states are
     # spelled this way, and _serialize() below for why an unset one never reaches the file.
     value_precision: Optional[int] = None
+    # Write non-numeric payloads from this stream as InfluxDB STRING fields instead of dropping
+    # them. Off by default, because the drop is what every existing stream and every existing series
+    # was built on: a topic that has only ever carried numbers must not suddenly start emitting
+    # string fields. See _serialize() below for why a stream that leaves it off writes no such key.
+    write_strings: bool = False
 
 
 def _config_path():
@@ -95,6 +100,12 @@ def _serialize(stream: StreamConfig) -> dict:
     record = asdict(stream)
     if record.get("value_precision") is None:
         del record["value_precision"]
+    # Same rule, same reason, for `write_strings`: a stream that never turned it on keeps a record an
+    # older image can still read. Falsy rather than `is False` on purpose — a hand-edited file
+    # carrying `null` or `0` there means "off" just as much as `false` does, and writing it back out
+    # would poison the file for an older build over a setting nobody actually asked for.
+    if not record.get("write_strings"):
+        del record["write_strings"]
     return record
 
 
