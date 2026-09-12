@@ -3,7 +3,8 @@
 A bridge from MQTT to InfluxDB, with a web UI.
 
 It subscribes to one or more MQTT brokers, recursively flattens whatever arrives — JSON objects
-become one point per leaf, booleans and numeric strings become numbers, anything else is dropped —
+become one point per leaf, booleans and numeric strings become numbers, anything else is dropped
+unless the stream turns on `write_strings` (see below) —
 filters out the topics that are noise (`zigbee2mqtt/bridge`, `homeassistant/`, firmware version
 topics and so on, see `EXCLUDED_SUBSTRINGS` in `src/influx_writer.py`) and writes the rest to
 InfluxDB in batches over the HTTP line-protocol endpoint.
@@ -52,8 +53,8 @@ a single JSON file:
 One record per stream: `id`, `name`, the MQTT side (`mqtt_host`, `mqtt_port`, `mqtt_user`,
 `mqtt_password`, `mqtt_topic`, `topic_prefix`), the InfluxDB side (`influx_host`, `influx_port`,
 `influx_user`, `influx_password`, `influx_database`), `enabled` and the optional
-`value_precision`. It holds credentials in plaintext, so it belongs on the volume and nowhere else
-— never in the repository, never in an image.
+`value_precision` and `write_strings`. It holds credentials in plaintext, so it belongs on the
+volume and nowhere else — never in the repository, never in an image.
 
 ### `value_precision`
 
@@ -80,13 +81,39 @@ An empty box in the UI and a missing key mean the same thing — the default. Tu
 is the state you have to type on purpose, so that clearing a field can never silently change what
 a production stream writes.
 
+### `write_strings`
+
+Off by default: a payload that is not a number and is not `true`/`false` is dropped, which is what
+this bridge has always done. Turn it on for one stream and a leftover like `Printing` on
+`/data/gcode/status` is written as an InfluxDB **string field** instead of disappearing.
+
+It changes nothing about the values that were already being written: numbers, numeric strings and
+the `true`/`false` → `10`/`0` mapping all take the same path as before, and only a value the number
+parser has already refused can reach the new branch. An empty payload stays dropped — clearing a
+retained topic publishes zero bytes, and that is the absence of a reading, not a reading of `""`.
+So does a payload that is a number the bridge refuses to store — `nan`, `inf`, a literal that
+overflows: those come from topics that carry floats the rest of the time, and writing them as
+strings would poison exactly the numeric series they belong to. The value is otherwise stored byte
+for byte, with one exception: a real newline or carriage return is written as the two characters
+`\n` / `\r`, because line protocol ends a record at a newline.
+
+It is per stream, set in the UI ("Write string values") or with a `PUT /api/streams/{id}`, and the
+API takes `true` or `false` and nothing else — `"false"` is a **422**, because it is a non-empty
+string and would otherwise be read as a yes.
+
+**The one thing to know before switching it on:** InfluxDB fixes a field's type on the first write.
+If a topic under this stream has ever written numbers into `value`, the first string for that
+measurement is refused with a 400 — and the refusal costs the entire batch it was sent in, not just
+that point. Use it on streams whose non-numeric topics are genuinely non-numeric.
+
 **One caveat, and it is about rolling the image back.** `load_streams()` builds each record with
 `StreamConfig(**record)` under a blanket `except Exception: return []`, so a key an older build
 does not declare does not skip that record — it empties the entire config, and the next save writes
-that emptiness to disk. A stream that never sets `value_precision` never gets the key written (see
-`_serialize` in `src/config.py`), so it stays readable by an older image exactly as before. A
-stream that does set it makes the whole file unreadable to a build that predates the field. **If
-you ever roll back past this feature, delete the `value_precision` keys from `streams.json` first.**
+that emptiness to disk. A stream that never sets `value_precision`, and one that leaves
+`write_strings` off, never gets that key written (see `_serialize` in `src/config.py`), so it stays
+readable by an older image exactly as before. A stream that does set either one makes the whole file
+unreadable to a build that predates that field. **If you ever roll back past these features, delete
+the `value_precision` and `write_strings` keys from `streams.json` first.**
 
 In production the state directory is a docker volume named `mqtt2influx_data`. **That volume is the
 entire configuration of the service**: lose it and every stream is gone. See the comment above the

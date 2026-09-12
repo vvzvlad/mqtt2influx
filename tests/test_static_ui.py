@@ -114,6 +114,17 @@ def _tests_for_an_empty_string(expr, name):
                 or re.search(r"(['\"])\1\s*===\s*\b" + ident + r"\b", expr))
 
 
+def _function_source(ui, declaration):
+    """One top-level function's source, from its declaration to the next one.
+
+    Same slicing rule as `save_stream_body` below, and it relies on the same property of this file:
+    every function in the script block starts in column zero.
+    """
+    start = ui.index(declaration)
+    following = re.compile(r"^(?:async )?function ", re.M).search(ui, start + 1)
+    return ui[start:following.start() if following else len(ui)]
+
+
 @pytest.fixture(scope="module")
 def ui():
     with open(INDEX_HTML, encoding="utf-8") as f:
@@ -299,6 +310,56 @@ def test_a_refused_save_keeps_the_modal_open(code):
     assert "return;" in failure, "without the return the modal closes anyway"
     assert "closeModal()" not in failure, "the modal must stay open, or the other edits are lost"
     assert check.start() < code.index("closeModal()"), "the modal closes before the check runs"
+
+
+# ── write_strings: the checkbox, and the value it renders into the log ────────────────────────────
+
+def test_the_string_values_checkbox_is_in_the_form(ui):
+    """The only way to turn the setting on without hand-editing streams.json or writing curl."""
+    tag = re.search(r"""<input[^>]*id=['"]fWriteStrings['"][^>]*>""", ui)
+    assert tag, "the write-strings checkbox is gone from the form"
+    assert re.search(r"""type=['"]checkbox['"]""", tag.group(0)), \
+        "the write-strings input must be a checkbox, or `.checked` is always undefined"
+
+
+def test_the_edit_form_prefills_the_checkbox_from_the_stream(ui):
+    """Without the prefill the box comes up EMPTY for a stream that has the setting on.
+
+    Every edit of that stream would then save `write_strings: false` — the operator opens the form
+    to rename it and silently turns the feature back off, which looks exactly like a save that
+    worked and stops the status topics being written again.
+    """
+    body = _strip_comments(_function_source(ui, "function openModal("))
+    assert re.search(r"""getElementById\(\s*(['"])fWriteStrings\1\s*\)\s*\.checked\s*=""", body), \
+        "openModal() no longer prefills the write-strings checkbox"
+    assert "write_strings" in body, "the prefill must read the stream's own value"
+
+
+def test_the_request_sends_the_checkbox_state(code):
+    """`write_strings` must carry what the box says, not a constant and not a string.
+
+    The API answers anything that is not a real bool with 422, so a truthy string here would not be
+    quietly accepted — it would be a form that refuses to save with a message about a field the
+    operator never typed into.
+    """
+    sent = _request_field(code, "write_strings")
+    assert "fWriteStrings" in sent, "the request no longer reads the write-strings checkbox"
+    assert ".checked" in sent, "`.checked` is what makes it a real boolean for the API"
+
+
+def test_the_log_value_is_html_escaped_like_the_topic_beside_it(ui):
+    """With string values on, a log line renders whatever was published to the broker.
+
+    The value used to be interpolated into `innerHTML` raw, which was safe only for as long as every
+    value was a number. A payload of `<img src=x onerror=...>` on any subscribed topic is script
+    execution in the page of whoever has the UI open — no login, no click, straight off the broker.
+    """
+    body = _strip_comments(_function_source(ui, "function appendLogEntryDOM("))
+    assert "innerHTML" in body, "the log row is built some other way now; re-check the escaping"
+    assert re.search(r"escHtml\(\s*entry\.value\s*\)", body), \
+        "the log value is no longer escaped; an MQTT payload can inject markup into the page"
+    assert not re.search(r"\$\{\s*entry\.value\s*\}", body), \
+        "the log value is still interpolated raw somewhere in the row"
 
 
 def test_the_edit_form_still_prefills_a_precision_of_zero(ui):

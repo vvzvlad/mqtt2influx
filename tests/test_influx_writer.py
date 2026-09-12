@@ -72,6 +72,70 @@ def test_make_line_names_its_timestamp_parameter_in_the_unit_it_receives():
     assert make_line(measurement="m", value=1.0, timestamp_ms=7) == "m value=1.0 7"
 
 
+# ── make_line: string fields ──────────────────────────────────────────────────────────────────────
+#
+# A stream with `write_strings` on hands this function the MQTT payload itself, so the FIELD half of
+# the record is now attacker-supplied exactly like the measurement half already was. Line protocol
+# quotes a string field and escapes two characters inside the quotes; the newline is the one that
+# decides whether a payload can write into measurements nobody configured.
+
+def test_a_string_value_is_written_as_a_quoted_field():
+    """The whole point of the feature, as InfluxDB receives it."""
+    assert make_line("data/gcode/status", "Printing", 5) == 'data/gcode/status value="Printing" 5'
+
+
+def test_a_numeric_value_is_still_written_unquoted():
+    """The regression guard for 604 million points: the number path is untouched, byte for byte.
+
+    An unsuffixed number is a float field and a quoted one is a string field — they are different
+    field TYPES to InfluxDB, and it fixes a field's type on the first write. Quoting a number here
+    would not write the same series differently, it would make every existing numeric field refuse
+    the batch it arrived in.
+    """
+    assert make_line("m", 1.5, 5) == "m value=1.5 5"
+    assert make_line("m", 10, 5) == "m value=10 5"
+    assert make_line("m", 0.0, 5) == "m value=0.0 5"
+
+
+def test_a_double_quote_inside_a_string_value_is_escaped():
+    """Unescaped, it closes the field early and the rest of the payload is parsed as syntax."""
+    assert make_line("m", 'say "hi"', 5) == 'm value="say \\"hi\\"" 5'
+
+
+def test_a_backslash_inside_a_string_value_is_escaped():
+    assert make_line("m", "a\\b", 5) == 'm value="a\\\\b" 5'
+
+
+def test_a_newline_inside_a_string_value_is_escaped():
+    assert make_line("m", "a\nb", 5) == 'm value="a\\nb" 5'
+
+
+def test_a_carriage_return_inside_a_string_value_is_escaped():
+    assert make_line("m", "a\rb", 5) == 'm value="a\\rb" 5'
+
+
+def test_the_backslash_in_a_string_value_is_escaped_before_the_quote():
+    # Input is the four characters  a \ " b.
+    # Escaping the backslash LAST would go back over the backslash the quote rule had just inserted
+    # and double it, leaving the quote preceded by an even number of backslashes — unescaped again,
+    # and the end of the field value in the middle of the payload. Order is the whole fix, and only
+    # an input containing both characters can tell the two orders apart.
+    assert make_line("m", 'a\\"b', 5) == 'm value="a\\\\\\"b" 5'
+
+
+def test_a_newline_in_a_string_payload_cannot_inject_a_second_record():
+    """The reason the escaping exists at all, stated as the attack rather than as the output.
+
+    `write_batch` joins the batch with "\\n". A raw newline inside a field value therefore ENDS the
+    record, and everything after it in the payload is read by InfluxDB as a new line-protocol
+    record — a write into any measurement whoever can publish to the broker chooses.
+    """
+    line = make_line("m", "x\nspoofed value=1 1", 5)
+
+    assert "\n" not in line
+    assert line == 'm value="x\\nspoofed value=1 1" 5'
+
+
 # ── contains_excluded: the topic filter ───────────────────────────────────────────────────────────
 
 @pytest.mark.parametrize("substring", EXCLUDED_SUBSTRINGS)
@@ -588,6 +652,116 @@ def test_a_json_array_payload_produces_nothing():
     supported, this is the test that has to change, and it names where.
     """
     assert list(flatten_payload("devices/x", [1, 2, 3])) == []
+
+
+# ── write_strings: the payloads that used to be dropped ───────────────────────────────────────────
+#
+# Half of this section is the new behaviour and half is the proof that it is ONLY new behaviour.
+# The flag is per stream and defaults to off, and the branch it opens sits behind `to_number()` —
+# so a value the number parser accepts can never reach it, and no series that exists today can
+# change shape because someone ticked a box on a different stream.
+
+def test_a_non_numeric_string_is_still_dropped_when_the_flag_is_off():
+    """The default, and what every stream in production keeps doing."""
+    assert list(flatten_payload("data/gcode/status", "Printing")) == []
+    assert list(flatten_payload("data/gcode/status", "Printing", write_strings=False)) == []
+
+
+def test_a_non_numeric_string_is_yielded_when_the_flag_is_on():
+    """The reported case: `/data/gcode/status` publishes "Printing" and it was never written."""
+    assert list(flatten_payload("data/gcode/status", "Printing", write_strings=True)) == [
+        ("data/gcode/status", "Printing")]
+
+
+def test_the_flag_reaches_a_string_leaf_of_a_nested_document():
+    """The recursion has to carry the flag, or only bare scalar payloads ever benefit."""
+    payload = {"temp": 21.0, "status": "Printing"}
+
+    assert sorted(flatten_payload("devices/x", payload, write_strings=True)) == [
+        ("devices/x/status", "Printing"),
+        ("devices/x/temp", 21.0),
+    ]
+
+
+def test_the_string_value_is_kept_verbatim_while_the_topic_is_still_normalised():
+    """Only the topic is lowercased and de-spaced — the value is a field, not a measurement name.
+
+    "Printing" and "printing" are different states of a printer, and lowercasing the value would
+    merge them in every dashboard downstream with nothing to say it happened.
+    """
+    assert list(flatten_payload("Data/Gcode Status", "Printing Now", write_strings=True)) == [
+        ("data/gcode_status", "Printing Now")]
+
+
+@pytest.mark.parametrize("flag", [False, True])
+def test_an_empty_payload_is_dropped_whether_or_not_the_flag_is_on(flag):
+    """Clearing a retained topic publishes zero bytes, and that is not a reading.
+
+    MQTT deletes a retained message by publishing an empty payload to the same topic. Writing it
+    would turn every "this value no longer exists" into a data point claiming the state is "".
+    """
+    assert list(flatten_payload("devices/x/status", "", write_strings=flag)) == []
+    assert list(flatten_payload("devices/x", {"status": ""}, write_strings=flag)) == []
+
+
+@pytest.mark.parametrize("payload, expected", [
+    (21.456, 21.46),      # a number, still rounded to the stream's precision
+    (21, 21.0),
+    ("12", 12.0),         # a numeric string, still parsed rather than stored as text
+    ("-4.5", -4.5),
+    (True, 10),           # the bridge's own markers, still 10 and 0 and still ints
+    (False, 0),
+    ("true", 10),
+    ("TRUE", 10),
+    ("false", 0),
+    ("False", 0),
+])
+def test_a_value_the_number_parser_accepts_is_untouched_by_the_flag(payload, expected):
+    """The invariant, and the only one that matters to the streams already running.
+
+    `to_number()` runs FIRST and the new branch only sees what it refused. If that order were ever
+    reversed — or if the string branch were widened to "any str" — then `"12"` would stop being 12.0
+    and `"true"` would stop being 10 on any stream with the flag on: a field-type conflict against
+    the numbers already in the database, which InfluxDB answers by refusing the whole batch.
+    """
+    off = list(flatten_payload("devices/x", {"v": payload}))
+    on = list(flatten_payload("devices/x", {"v": payload}, write_strings=True))
+
+    assert off == on == [("devices/x/v", expected)]
+    # And the same Python type, because `10` and `10.0` are different bytes in the request body.
+    assert type(on[0][1]) is type(off[0][1])
+
+
+@pytest.mark.parametrize("payload", ["nan", "NaN", "inf", "-inf", "Infinity", "1e400", "9" * 400])
+@pytest.mark.parametrize("flag", [False, True])
+def test_a_number_the_bridge_refuses_to_store_is_dropped_rather_than_stringified(payload, flag):
+    """The other half of the invariant, and the one that costs a batch when it breaks.
+
+    `to_number()` answers None for two unrelated reasons, and only one of them is a string: these
+    payloads ARE numbers, dropped by `_to_storable_float()` because InfluxDB cannot store them —
+    "nan" is what a sensor with no reading publishes, and the long literals overflow to an infinity.
+    They arrive on topics that carry floats the rest of the time, so writing them as string fields
+    would put a string into a field already typed as a float: a permanent 400 that takes the whole
+    batch of 220 points with it, and no retry. The flag must not reach them.
+    """
+    assert list(flatten_payload("devices/x/temp", payload, write_strings=flag)) == []
+
+
+@pytest.mark.parametrize("value", [None, [1, 2], 21.456, "12", True])
+def test_only_a_string_can_take_the_new_path(value):
+    """The flag does not make every dropped payload storable — a null and a list stay dropped.
+
+    The numbers and the numeric string are in the list for the other direction: they are yielded, but
+    as NUMBERS, so nothing here ever comes back quoted.
+    """
+    yielded = list(flatten_payload("devices/x", {"v": value}, write_strings=True))
+
+    if value is None or isinstance(value, list):
+        # Stated as emptiness rather than as "nothing here is a str": for these two the list IS
+        # empty, and `all()` over an empty list is true no matter what the branch does.
+        assert yielded == []
+    else:
+        assert all(not isinstance(v, str) for _topic, v in yielded)
 
 
 # ── InfluxWriter.write_batch: the HTTP write ──────────────────────────────────────────────────────

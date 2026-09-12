@@ -367,6 +367,135 @@ def test_a_body_with_no_precision_key_at_all_is_accepted(client):
     assert load_streams()[0].value_precision is None
 
 
+# ── write_strings: the flag that decides whether a status string is written at all ────────────────
+#
+# The processor resolves this field with `bool(...)` and `StreamConfig(**body)` checks no types, so
+# every truthy non-bool is a silent yes — `"false"` most of all, which is what a shell script or a
+# hand-written body spells it as. InfluxDB fixes a field's type on the first write, so a stream
+# flipped into string mode by accident does not write slightly different data, it gets whole batches
+# refused on every topic that ever carried a number.
+
+def test_a_stream_created_without_the_flag_reports_it_as_off(client):
+    """Absent means the default, and the default is what every existing stream does."""
+    created = create(client)
+
+    assert created["write_strings"] is False
+    assert client.get("/api/streams").json()[0]["write_strings"] is False
+    assert load_streams()[0].write_strings is False
+
+
+def test_the_flag_round_trips_through_post(client):
+    created = create(client, write_strings=True)
+
+    assert created["write_strings"] is True
+    assert load_streams()[0].write_strings is True
+    assert client.get("/api/streams").json()[0]["write_strings"] is True
+
+
+def test_put_turns_the_flag_on_and_it_reaches_the_config_file(client):
+    """The operator's real path: an existing stream edited in the UI."""
+    created = create(client)
+
+    response = client.put("/api/streams/{}".format(created["id"]), json={"write_strings": True})
+
+    assert response.status_code == 200, response.text
+    assert response.json()["write_strings"] is True
+    on_disk = load_streams()
+    assert on_disk[0].write_strings is True
+    # Not sent in the PUT body, so it has to have been carried over rather than reset.
+    assert on_disk[0].influx_database == "metrics"
+
+
+def test_put_can_turn_the_flag_off_again(client):
+    created = create(client, write_strings=True)
+
+    updated = client.put("/api/streams/{}".format(created["id"]),
+                         json={"write_strings": False}).json()
+
+    assert updated["write_strings"] is False
+    assert load_streams()[0].write_strings is False
+
+
+def test_a_put_that_does_not_mention_the_flag_leaves_it_alone(client):
+    created = create(client, write_strings=True)
+
+    updated = client.put("/api/streams/{}".format(created["id"]), json={"name": "renamed"}).json()
+
+    assert updated["name"] == "renamed"
+    assert updated["write_strings"] is True
+
+
+REJECTED_WRITE_STRINGS = [
+    "false",   # the spelling a shell script produces — and a truthy string in Python
+    "true",
+    1,         # int, not bool: `bool(1)` is True and nothing else would have said no
+    0,
+    None,      # unlike value_precision, there is no "unset" state to spell
+    [],
+    {},
+]
+REJECTED_WS_IDS = ["str-false", "str-true", "one", "zero", "null", "list", "dict"]
+
+
+@pytest.mark.parametrize("bad", REJECTED_WRITE_STRINGS, ids=REJECTED_WS_IDS)
+def test_post_refuses_a_write_strings_that_is_not_a_bool(client, bad):
+    response = client.post("/api/streams", json=dict(STREAM_BODY, write_strings=bad))
+
+    assert response.status_code == 422, response.text
+    assert "write_strings" in response.json()["detail"]
+    # Refused BEFORE the write, not after it: nothing reached the file and nothing is listed.
+    assert load_streams() == []
+    assert client.get("/api/streams").json() == []
+
+
+@pytest.mark.parametrize("bad", REJECTED_WRITE_STRINGS, ids=REJECTED_WS_IDS)
+def test_put_refuses_a_write_strings_that_is_not_a_bool(client, manager_calls, bad):
+    """And leaves the stored stream and the running processor exactly as they were."""
+    created = create(client, write_strings=True)
+    manager_calls.restarted.clear()
+
+    response = client.put("/api/streams/{}".format(created["id"]), json={"write_strings": bad})
+
+    assert response.status_code == 422, response.text
+    assert "write_strings" in response.json()["detail"]
+    assert load_streams()[0].write_strings is True
+    assert client.get("/api/streams").json()[0]["write_strings"] is True
+    assert manager_calls.restarted == []
+
+
+@pytest.mark.parametrize("method", ["post", "put"])
+def test_the_string_false_is_refused_rather_than_read_as_a_yes(client, method):
+    """The one bad value that would otherwise flip a production stream into string mode silently.
+
+    `bool("false")` is True — it is a non-empty string. Without the type check the API would answer
+    200, streams.json would read `"write_strings": "false"`, the UI checkbox would show it ticked
+    and the stream would start writing string fields into measurements that hold numbers.
+    """
+    if method == "post":
+        response = client.post("/api/streams", json=dict(STREAM_BODY, write_strings="false"))
+        assert response.status_code == 422, response.text
+        assert load_streams() == []
+    else:
+        created = create(client)
+        response = client.put("/api/streams/{}".format(created["id"]),
+                              json={"write_strings": "false"})
+        assert response.status_code == 422, response.text
+        assert load_streams()[0].write_strings is False
+
+
+def test_a_body_with_no_write_strings_key_at_all_is_accepted(client):
+    """A curl one-liner written before this feature existed must keep working."""
+    # Asserted rather than filtered: the fixture does not carry the key today, and if someone ever
+    # adds it there this test would quietly stop being about a body that omits it.
+    assert "write_strings" not in STREAM_BODY
+
+    response = client.post("/api/streams", json=STREAM_BODY)
+
+    assert response.status_code == 200, response.text
+    assert response.json()["write_strings"] is False
+    assert load_streams()[0].write_strings is False
+
+
 def test_delete_removes_the_stream(client):
     created = create(client)
 

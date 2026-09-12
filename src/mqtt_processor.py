@@ -89,6 +89,10 @@ class StreamProcessor:
         # is rebuilt from scratch by manager.restart_stream() after every edit, so this stays in
         # step with streams.json without being re-read.
         self._value_precision = resolve_value_precision(cfg.value_precision, cfg.id)
+        # Same treatment for the same reason: read once from the config a restart rebuilt this
+        # processor from, not per message. bool() because streams.json is hand-editable and
+        # `StreamConfig(**record)` type-checks nothing, so this field can arrive as anything.
+        self._write_strings = bool(cfg.write_strings)
 
         # The pending batch is shared between the message loop and the interval timer task, so every
         # read and write of it goes through the lock. Without it one task appends to the list while
@@ -372,7 +376,7 @@ class StreamProcessor:
                         points = [
                             (flat_topic, value, int(time.time() * 1000))
                             for flat_topic, value in flatten_payload(
-                                full_topic, payload, self._value_precision)
+                                full_topic, payload, self._value_precision, self._write_strings)
                         ]
                         if not points:
                             continue
