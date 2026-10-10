@@ -42,6 +42,7 @@
   .badge { display: inline-block; padding: 1px 6px; border-radius: 4px; font-size: 10px; font-weight: 700; }
   .badge-green { background: rgba(34,197,94,.15); color: var(--green); }
   .badge-red { background: rgba(239,68,68,.15); color: var(--red); }
+  .badge-yellow { background: rgba(245,158,11,.15); color: var(--yellow); }
   .content { display: flex; flex-direction: column; overflow: hidden; }
   .panel { padding: 16px 20px; border-bottom: 1px solid var(--border); }
   .panel-title { font-size: 11px; font-weight: 600; text-transform: uppercase; letter-spacing: .08em; color: var(--muted); margin-bottom: 10px; }
@@ -252,18 +253,31 @@ function connectWS() {
   };
   ws.onmessage = (e) => {
     const msg = JSON.parse(e.data);
-    if (msg.type === 'snapshot') {
-      msg.data.forEach(s => { statsMap[s.id] = s; });
-      renderStats();
-    } else if (msg.type === 'stats') {
-      msg.data.forEach(s => { statsMap[s.id] = s; });
-      renderStats();
+    if (msg.type === 'snapshot' || msg.type === 'stats') {
+      applyStats(msg.data);
     } else if (msg.type === 'message') {
       handleLiveMessage(msg.stream_id, msg.data);
     } else if (msg.type === 'flush') {
       // ignore here, stats covers it
     }
   };
+}
+
+// The list badge reads `connected` from here too: /api/streams is fetched only on load and after an
+// action, so on its own the badge would stay yellow after a Start and green after the link drops.
+function applyStats(data) {
+  let linkChanged = false;
+  data.forEach(s => {
+    statsMap[s.id] = s;
+    const st = streams[s.id];
+    if (st && st.connected !== s.connected) {
+      st.connected = s.connected;
+      linkChanged = true;
+    }
+  });
+  // Only on a change: a re-render rebuilds the list's buttons, and every 2s that would eat clicks.
+  if (linkChanged) renderStreamList();
+  renderStats();
 }
 
 function handleLiveMessage(streamId, data) {
@@ -355,9 +369,12 @@ function renderStreamList() {
   el.innerHTML = ids.map(id => {
     const s = streams[id];
     const running = s.running;
-    const badge = running
-      ? '<span class="badge badge-green">running</span>'
-      : '<span class="badge badge-red">stopped</span>';
+    // Green needs the MQTT link as well as the task: a live task retrying a dead link is not healthy.
+    const badge = !running
+      ? '<span class="badge badge-red">stopped</span>'
+      : s.connected
+        ? '<span class="badge badge-green">running</span>'
+        : '<span class="badge badge-yellow">disconnected</span>';
     const active = id === selectedId ? ' active' : '';
     const toggleBtn = running
       ? `<button class="btn btn-stop btn-sm" onclick="toggleStream('${id}',event)">Stop</button>`
