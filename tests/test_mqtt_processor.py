@@ -813,6 +813,118 @@ async def test_a_stream_that_leaves_the_message_loop_on_its_own_still_flushes_wh
     assert live_flush_timers() == []
 
 
+async def test_a_disconnect_that_times_out_during_a_shutdown_still_flushes_what_it_batched(monkeypatch):
+    """aiomqtt's `__aexit__` can turn the cancellation unwinding through it into an `MqttError`.
+
+    Its disconnect wait is bounded by the client's `timeout=`, and the expiry raises
+    `MqttError("Operation timed out")` in place of the `CancelledError`. The loop's `except Exception`
+    absorbs that, `while self._running` is already false, and `_process_forever` returns NORMALLY —
+    past a final flush that used to live in a handler for the cancellation.
+    """
+    monkeypatch.setattr(mqtt_processor, "BATCH_INTERVAL", 60)   # no interval flush
+    monkeypatch.setattr(mqtt_processor, "BATCH_SIZE", 1000)     # no size flush
+    queue = asyncio.Queue()
+    install_fake_client(monkeypatch, queue)
+
+    class _DisconnectTimesOut(mqtt_processor.aiomqtt.Client):  # the fake installed just above
+        async def __aexit__(self, exc_type, exc, tb):
+            if exc_type is asyncio.CancelledError:
+                raise aiomqtt.MqttError("Operation timed out")
+            return False
+
+    monkeypatch.setattr(mqtt_processor.aiomqtt, "Client", _DisconnectTimesOut)
+
+    proc = make_processor()
+    writer = FakeWriter()
+    proc._running = True
+    task = asyncio.create_task(proc._connect_and_process(writer))
+    queue.put_nowait(FakeMessage("dev/a", "1"))
+    assert await eventually(lambda: proc.batch_current == 1), "the point never reached the batch"
+
+    # What stop() does: the flag and the cancel in one run of statements.
+    proc._running = False
+    task.cancel()
+    # A normal return, not a CancelledError: the MqttError replaced it, which is the path under test.
+    await asyncio.wait_for(task, timeout=5)
+
+    assert proc.errors == 1, "the MqttError never reached the loop's except Exception"
+    assert [(topic, value) for topic, value, _ts in writer.stored] == [("dev/a", 1.0)]
+    assert proc._batch == []
+    assert proc.batch_current == 0
+    assert live_flush_timers() == []
+
+
+async def test_a_shutdown_during_the_reconnect_backoff_still_flushes_what_it_batched(monkeypatch):
+    """A cancellation landing in the backoff sleep is raised INSIDE the `except Exception` body.
+
+    A sibling `except asyncio.CancelledError` of the same `try` would not catch what another of its
+    handlers raises, so while the final flush lived in one, a stream stopped while it waited to
+    reconnect left with the points it had batched before the link dropped.
+    """
+    monkeypatch.setattr(mqtt_processor, "BATCH_INTERVAL", 60)   # no interval flush
+    monkeypatch.setattr(mqtt_processor, "BATCH_SIZE", 1000)     # no size flush
+    queue = asyncio.Queue()
+    install_dropping_client(monkeypatch, [queue])
+
+    proc = make_processor()
+
+    # make_processor's callback suspends; this one does not, so nothing between the `except`
+    # catching the drop and the backoff sleep yields to the event loop. By the time this test can
+    # see `errors` move, the processor is parked in that sleep — at its real length, which the
+    # cancellation below cuts short.
+    async def on_event_without_a_suspension(sid, event_type, data):
+        proc.events.append((sid, event_type, data))
+
+    proc.on_event = on_event_without_a_suspension
+    writer = FakeWriter()
+    proc._running = True
+    task = asyncio.create_task(proc._connect_and_process(writer))
+    queue.put_nowait(FakeMessage("dev/a", "1"))
+    assert await eventually(lambda: proc.batch_current == 1), "the point never reached the batch"
+
+    queue.put_nowait(aiomqtt.MqttError("Disconnected during message iteration"))
+    assert await eventually(lambda: proc.errors == 1), "the link never dropped"
+
+    await _stop(proc, task)
+
+    assert [(topic, value) for topic, value, _ts in writer.stored] == [("dev/a", 1.0)]
+    assert proc._batch == []
+    assert proc.batch_current == 0
+    assert live_flush_timers() == []
+
+
+async def test_a_flush_timer_that_died_does_not_take_the_final_flush_with_it(monkeypatch, caplog):
+    """The timer is awaited before the final flush, and it can end in something other than a
+    cancellation. Swallowing only `CancelledError` there let any other exception out of the
+    `finally` ahead of the flush, and the whole batch went with it."""
+    monkeypatch.setattr(mqtt_processor, "BATCH_SIZE", 1000)     # no size flush
+    queue = asyncio.Queue()
+    install_fake_client(monkeypatch, queue)
+
+    proc = make_processor()
+
+    async def dying_timer(_writer):
+        raise RuntimeError("timer crashed")
+
+    monkeypatch.setattr(proc, "_flush_timer", dying_timer)
+    writer = FakeWriter()
+    proc._running = True
+    task = asyncio.create_task(proc._connect_and_process(writer))
+    queue.put_nowait(FakeMessage("dev/a", "1"))
+    assert await eventually(lambda: proc.batch_current == 1), "the point never reached the batch"
+
+    with caplog.at_level(logging.ERROR, logger="src.mqtt_processor"):
+        task.cancel()
+        # Waited for rather than awaited, so that how the task ended is judged after the batch.
+        await asyncio.wait([task])
+
+    assert [(topic, value) for topic, value, _ts in writer.stored] == [("dev/a", 1.0)]
+    assert proc._batch == []
+    assert task.cancelled(), "the timer's error escaped the shutdown in place of the cancellation"
+    assert ("ERROR", "[s1] Flush timer died: timer crashed") in [
+        (r.levelname, r.getMessage()) for r in caplog.records]
+
+
 # --- a failure InfluxDB will give again is not worth asking about again ---------------------------
 
 async def test_an_answer_that_will_not_change_is_not_retried(instant_retries):

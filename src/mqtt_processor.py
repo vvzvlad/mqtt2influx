@@ -6,7 +6,7 @@ import asyncio
 import json
 import logging
 import time
-from contextlib import AsyncExitStack, suppress
+from contextlib import AsyncExitStack
 from typing import Callable, Optional
 
 import aiomqtt
@@ -343,8 +343,14 @@ class StreamProcessor:
             # Finally the flush itself runs WITHOUT the retry ladder, so a shutdown never waits out
             # its sleeps against a dead InfluxDB.
             timer.cancel()
-            with suppress(asyncio.CancelledError):
+            try:
                 await timer
+            except asyncio.CancelledError:
+                pass
+            # Anything else the timer died of must not escape this finally ahead of the flush
+            # below: it would take the whole batch with it.
+            except Exception as e:  # noqa: BLE001
+                logger.error("[%s] Flush timer died: %s", self.cfg.id, e)
             await self._flush(writer, retry=False)
 
     async def _process_forever(self, writer: InfluxWriter):
