@@ -17,16 +17,19 @@ The two things being pinned:
 
 import asyncio
 import importlib
+import logging
 import os
+import threading
 import time
 from contextlib import suppress
 
 import aiomqtt
 import pytest
 
-from src import mqtt_processor
-from src.config import StreamConfig
+from src import api, mqtt_processor
+from src.config import StreamConfig, save_streams
 from src.mqtt_processor import StreamProcessor
+from src.stream_manager import manager
 
 
 # --- doubles ------------------------------------------------------------------------------------
@@ -1005,3 +1008,199 @@ async def test_the_bound_reaches_the_queue_aiomqtt_actually_builds():
     )
 
     assert client._queue.maxsize == mqtt_processor.MAX_QUEUED_INCOMING_MESSAGES
+
+
+# --- the MQTT link, as opposed to the task --------------------------------------------------------
+#
+# On 2026-08-27 a stream spent 15 minutes failing to connect to a healthy broker, once every 15
+# seconds, while GET /api/streams reported `running: true` — the task was alive the whole time and
+# nothing anywhere described the link. The `except` that ran sixty times that afternoon had no test.
+
+def install_refusing_client(monkeypatch, on_construct):
+    """Replace aiomqtt.Client with one whose connect always fails, the way aiomqtt reports it."""
+
+    class _FakeClient:
+        def __init__(self, **kwargs):
+            on_construct(self)
+
+        async def __aenter__(self):
+            await asyncio.sleep(0)
+            raise aiomqtt.MqttError("Operation timed out")
+
+        async def __aexit__(self, *exc_info):
+            raise AssertionError("a connect that failed has nothing to exit")
+
+    monkeypatch.setattr(mqtt_processor.aiomqtt, "Client", _FakeClient)
+
+
+def install_dropping_client(monkeypatch, queues, on_construct=lambda: None):
+    """Client number i reads its messages from `queues[i]`. An exception put into a queue is raised
+    out of the message iterator — a connection dropped mid-stream, as aiomqtt reports one."""
+    constructed = []
+
+    class _FakeClient:
+        def __init__(self, **kwargs):
+            on_construct()
+            self.queue = queues[len(constructed)]
+            constructed.append(self)
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *exc_info):
+            return False
+
+        async def subscribe(self, topic):
+            pass
+
+        @property
+        def messages(self):
+            async def _iter():
+                while True:
+                    item = await self.queue.get()
+                    if isinstance(item, BaseException):
+                        raise item
+                    yield item
+
+            return _iter()
+
+    monkeypatch.setattr(mqtt_processor.aiomqtt, "Client", _FakeClient)
+
+
+def event_types(proc):
+    return [event_type for _sid, event_type, _data in proc.events]
+
+
+async def test_a_connect_that_keeps_failing_is_counted_escalated_and_never_reported_connected(monkeypatch, caplog):
+    monkeypatch.setattr(mqtt_processor, "RECONNECT_DELAY", 0)
+    monkeypatch.setattr(mqtt_processor, "BATCH_INTERVAL", 60)
+    proc = make_processor()
+    connected_at_each_attempt = []
+
+    def on_construct(_client):
+        connected_at_each_attempt.append(proc.connected)
+        if len(connected_at_each_attempt) >= 5:
+            proc._running = False  # the fifth attempt still runs and fails; then the loop ends
+
+    install_refusing_client(monkeypatch, on_construct)
+    proc._running = True
+
+    with caplog.at_level(logging.WARNING, logger="src.mqtt_processor"):
+        await asyncio.wait_for(proc._connect_and_process(FakeWriter()), timeout=5)
+
+    assert connected_at_each_attempt == [False] * 5
+    assert proc.connected is False
+    assert proc.errors == 5
+    assert proc.get_stats()["consecutive_failures"] == 5
+    assert proc.get_stats()["connected"] is False
+    # Four in a row is one minute at the production cadence; from there on the line is an ERROR.
+    retry_lines = [r.levelname for r in caplog.records if "Error: Operation timed out" in r.getMessage()]
+    assert retry_lines == ["WARNING", "WARNING", "WARNING", "ERROR", "ERROR"]
+    assert event_types(proc).count("disconnected") == 5
+    assert "connected" not in event_types(proc)
+
+
+async def test_a_link_dropped_mid_stream_is_down_until_the_reconnect_resets_the_count(monkeypatch):
+    monkeypatch.setattr(mqtt_processor, "RECONNECT_DELAY", 0)
+    monkeypatch.setattr(mqtt_processor, "BATCH_INTERVAL", 60)
+    first, second = asyncio.Queue(), asyncio.Queue()
+    proc = make_processor()
+    # Read at the moment each client is built, i.e. after the previous one's exit and the delay:
+    # with RECONNECT_DELAY at 0 that is the only point at which the down state can be observed.
+    state_at_each_attempt = []
+    install_dropping_client(
+        monkeypatch, [first, second],
+        on_construct=lambda: state_at_each_attempt.append((proc.connected, proc.consecutive_failures)))
+    proc._running = True
+    task = asyncio.create_task(proc._connect_and_process(FakeWriter()))
+
+    try:
+        assert await eventually(lambda: proc.connected), "the first connect never happened"
+        first.put_nowait(FakeMessage("dev/a", "1"))
+        assert await eventually(lambda: proc.last_message_time > 0)
+        first.put_nowait(aiomqtt.MqttError("Disconnected during message iteration"))
+        assert await eventually(lambda: proc.reconnects == 1), "the stream never reconnected"
+
+        assert state_at_each_attempt == [(False, 0), (False, 1)]
+        assert proc.connected is True
+        assert proc.consecutive_failures == 0
+        stats = proc.get_stats()
+        assert (stats["connected"], stats["reconnects"], stats["consecutive_failures"]) == (True, 1, 0)
+        assert stats["last_connect_time"] > 0
+        assert event_types(proc) == ["connected", "message", "error", "disconnected", "connected"]
+    finally:
+        await _stop(proc, task)
+
+    # A cancellation leaves the loop without passing through the `except`.
+    assert proc.connected is False
+
+
+async def test_a_stream_whose_link_is_down_is_running_but_not_connected_in_stats_and_api(monkeypatch, data_dir):
+    monkeypatch.setattr(mqtt_processor, "RECONNECT_DELAY", 3600)  # parks the task in the retry wait
+    monkeypatch.setattr(mqtt_processor, "BATCH_INTERVAL", 60)
+    queue = asyncio.Queue()
+    install_dropping_client(monkeypatch, [queue])
+    proc = make_processor()
+    monkeypatch.setattr(proc, "_run", lambda: proc._connect_and_process(FakeWriter()))
+    save_streams([proc.cfg])
+    manager._processors[proc.cfg.id] = proc
+    proc.start()
+
+    try:
+        assert await eventually(lambda: proc.connected), "the connect never happened"
+        # Healthy first, so the field below is shown to be able to say true at all.
+        (listed,) = await api.list_streams()
+        assert (listed["running"], listed["connected"]) == (True, True)
+
+        queue.put_nowait(aiomqtt.MqttError("Disconnected during message iteration"))
+        assert await eventually(lambda: proc.consecutive_failures == 1)
+
+        assert proc.is_alive is True
+        assert proc.get_stats()["connected"] is False
+        (listed,) = await api.list_streams()
+        assert listed["running"] is True
+        assert listed["connected"] is False
+    finally:
+        manager._processors.pop(proc.cfg.id, None)
+        await proc.stop()
+
+
+async def test_a_connect_that_hangs_in_the_executor_is_bounded_and_retried(monkeypatch):
+    # aiomqtt's __aenter__ runs paho's blocking connect() in an executor thread before its own
+    # timeout starts, so a hung DNS lookup or kernel connect used to block the stream for good.
+    monkeypatch.setattr(mqtt_processor, "MQTT_TIMEOUT", 0.05)
+    monkeypatch.setattr(mqtt_processor, "RECONNECT_DELAY", 0)
+    monkeypatch.setattr(mqtt_processor, "BATCH_INTERVAL", 60)
+    released = threading.Event()
+    proc = make_processor()
+    attempts = []
+
+    class _HangingClient:
+        def __init__(self, **kwargs):
+            attempts.append(kwargs)
+            if len(attempts) >= 2:
+                proc._running = False
+
+        async def __aenter__(self):
+            # The same shape as aiomqtt's: a thread no cancellation can interrupt.
+            await asyncio.get_running_loop().run_in_executor(None, released.wait)
+            return self
+
+        async def __aexit__(self, *exc_info):
+            return False
+
+    monkeypatch.setattr(mqtt_processor.aiomqtt, "Client", _HangingClient)
+    proc._running = True
+
+    try:
+        await asyncio.wait_for(proc._connect_and_process(FakeWriter()), timeout=2)
+    finally:
+        released.set()
+
+    assert len(attempts) == 2
+    assert proc.errors == 2
+    assert proc.consecutive_failures == 2
+    assert proc.connected is False
+    errors = [data["message"] for _sid, event_type, data in proc.events if event_type == "error"]
+    # Twice MQTT_TIMEOUT: the second one is aiomqtt's CONNACK wait, which the bound must not pre-empt.
+    assert errors == ["Connect did not complete within 0.1s"] * 2

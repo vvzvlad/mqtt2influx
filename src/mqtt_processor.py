@@ -6,7 +6,7 @@ import asyncio
 import json
 import logging
 import time
-from contextlib import suppress
+from contextlib import AsyncExitStack, suppress
 from typing import Callable, Optional
 
 import aiomqtt
@@ -75,6 +75,19 @@ RETRY_BUDGET = 5.0
 # threaten the host, and far above any backlog an ordinary InfluxDB restart can build.
 MAX_QUEUED_INCOMING_MESSAGES = 50_000
 
+# The client's `timeout=` (CONNACK, SUBACK, the disconnect wait), and the same budget again for the
+# connect step before it. aiomqtt runs paho's blocking connect() in an executor BEFORE that timeout
+# starts, so a hung DNS lookup (paho bounds the TCP connect itself at 5s, but not getaddrinfo) would
+# otherwise block this stream forever with no error at all.
+MQTT_TIMEOUT = 10
+
+# Pause between a failed attempt and the next one.
+RECONNECT_DELAY = 5
+
+# Consecutive failed attempts after which the retry line is logged at ERROR instead of WARNING: one
+# minute at the 15s cadence (MQTT_TIMEOUT + RECONNECT_DELAY) of a broker that never answers.
+FAILURES_BEFORE_ERROR = 4
+
 
 class StreamProcessor:
     def __init__(self, cfg: StreamConfig, on_event: Callable):
@@ -130,6 +143,14 @@ class StreamProcessor:
         self.last_flush_time: float = 0.0
         self.last_flush_count: int = 0
         self.last_flush_ok: bool = True
+        # The MQTT link, as opposed to the task: `is_alive` stays true through every failure the
+        # reconnect loop survives, which is how a stream reported running for 15 minutes while
+        # writing nothing.
+        self.connected = False
+        self.last_message_time: float = 0.0
+        self.last_connect_time: float = 0.0
+        self.reconnects = 0  # successful connects after the first one
+        self.consecutive_failures = 0  # failed attempts since the last successful connect
 
     @property
     def is_alive(self) -> bool:
@@ -332,15 +353,37 @@ class StreamProcessor:
                 client_kwargs = dict(
                     hostname=self.cfg.mqtt_host,
                     port=self.cfg.mqtt_port,
-                    timeout=10,
+                    timeout=MQTT_TIMEOUT,
+                    # aiomqtt's default, passed so that it is a choice: keepalive is the only thing
+                    # that detects a half-open socket.
+                    keepalive=60,
                     max_queued_incoming_messages=MAX_QUEUED_INCOMING_MESSAGES,
                 )
                 if self.cfg.mqtt_user:
                     client_kwargs["username"] = self.cfg.mqtt_user
                     client_kwargs["password"] = self.cfg.mqtt_password
 
-                async with aiomqtt.Client(**client_kwargs) as client:
+                # The stack stands in for `async with aiomqtt.Client(...)` so that entering it — the
+                # connect — can be bounded. On a timeout nothing was entered and nothing is exited,
+                # exactly as when __aenter__ raises.
+                # Two MQTT_TIMEOUTs: the first for the executor connect, the second for aiomqtt's own
+                # CONNACK wait. With one, this bound would always expire first and pre-empt aiomqtt's
+                # timeout path, which reports "Operation timed out" and resets the client's connect
+                # future; cancelled instead, that future makes a later disconnect callback log a
+                # CancelledError traceback.
+                connect_bound = 2 * MQTT_TIMEOUT
+                async with AsyncExitStack() as stack:
+                    try:
+                        client = await asyncio.wait_for(
+                            stack.enter_async_context(aiomqtt.Client(**client_kwargs)), connect_bound)
+                    except TimeoutError:
+                        raise aiomqtt.MqttError(f"Connect did not complete within {connect_bound}s") from None
                     await client.subscribe(self.cfg.mqtt_topic)
+                    self.connected = True
+                    self.consecutive_failures = 0
+                    if self.last_connect_time:
+                        self.reconnects += 1
+                    self.last_connect_time = time.time()
                     await self.on_event(self.cfg.id, "connected", {})
                     logger.info("[%s] MQTT connected, subscribed to %s", self.cfg.id, self.cfg.mqtt_topic)
 
@@ -360,6 +403,7 @@ class StreamProcessor:
                             payload_raw = str(message.payload)
 
                         self.msgs_received += 1
+                        self.last_message_time = time.time()
 
                         if contains_excluded(topic):
                             self.msgs_filtered += 1
@@ -407,11 +451,19 @@ class StreamProcessor:
                             await self._flush(writer)
 
             except Exception as e:
+                # Before any await: the RECONNECT_DELAY sleep below is link-down time too.
+                self.connected = False
                 self.errors += 1
-                logger.error("[%s] Error: %s", self.cfg.id, e)
+                self.consecutive_failures += 1
+                level = logging.ERROR if self.consecutive_failures >= FAILURES_BEFORE_ERROR else logging.WARNING
+                logger.log(level, "[%s] Error: %s", self.cfg.id, e)
                 await self.on_event(self.cfg.id, "error", {"message": str(e)})
+                await self.on_event(self.cfg.id, "disconnected", {})
                 if self._running:
-                    await asyncio.sleep(5)
+                    await asyncio.sleep(RECONNECT_DELAY)
+            finally:
+                # The exits that are not an exception: the `break` above and a cancellation.
+                self.connected = False
 
     def get_stats(self) -> dict:
         return {
@@ -430,4 +482,9 @@ class StreamProcessor:
             "last_flush_time": self.last_flush_time,
             "last_flush_count": self.last_flush_count,
             "last_flush_ok": self.last_flush_ok,
+            "connected": self.connected,
+            "last_message_time": self.last_message_time,
+            "last_connect_time": self.last_connect_time,
+            "reconnects": self.reconnects,
+            "consecutive_failures": self.consecutive_failures,
         }

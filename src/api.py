@@ -102,6 +102,8 @@ async def list_streams():
     for s in streams:
         d = asdict(s)
         d["running"] = manager.is_running(s.id)
+        # Separate from `running`, which stays the task flag: a live task can be retrying a dead link.
+        d["connected"] = manager.get_stats(s.id).get("connected", False)
         result.append(d)
     return result
 
