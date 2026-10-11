@@ -34,48 +34,29 @@ def contains_excluded(topic: str) -> bool:
     return any(sub in topic for sub in EXCLUDED_SUBSTRINGS)
 
 
-# How many decimals a value is rounded to when the stream does not ask for anything else. Two is
-# what this service has always done, to every number, unconditionally — 604 million points were
-# written under that rule and every dashboard and continuous query downstream was built on top of
-# it. So it stays the default: a stream that says nothing about precision must keep writing exactly
-# the numbers it wrote yesterday.
+# Decimals for a stream that sets no precision; existing series and the dashboards built on them
+# assume two.
 DEFAULT_VALUE_PRECISION = 2
 
-# The `value_precision` a stream sets to be stored unrounded. Any negative number means the same
-# thing; -1 is the canonical spelling and the one the UI writes.
-#
-# A negative sentinel rather than a null, and that is the whole design decision. The three states a
-# stream needs are "not configured", "N decimals" and "do not round", but a single Optional[int]
-# field only spells two of them, so one state has to be encoded. Null is the wrong one to spend:
-# an absent key and an explicit `null` are the same thing to every JSON producer there is — a
-# cleared number input in the UI, a config generator filling in blanks — and if `null` meant "do
-# not round" then clearing that box on the Wirenboard stream would silently switch 134 million
-# messages a year to full precision. So both spellings of "unset" collapse to the default, and the
-# dangerous state is the one you have to type on purpose. `round(x, -1)` does mean "round to tens"
-# in Python, which is what this steals; no telemetry bridge has ever wanted that.
+# The `value_precision` a stream sets to be stored unrounded. Any negative number means the same;
+# -1 is the canonical spelling and the one the UI writes. Not null: an absent key and `null` (a
+# cleared UI field) both mean the default, so turning rounding off has to be typed on purpose.
 RAW_VALUE_PRECISION = -1
 
 
 def resolve_value_precision(configured, stream_id: str = "") -> Optional[int]:
     """Turn a stream's configured `value_precision` into the argument the rounding takes.
 
-    Two layers, two vocabularies, and they are deliberately not the same one. The CONFIG has three
-    states (unset, N decimals, do not round) because an operator needs all three; the rounding has
-    two (an int, or None for "skip the round() call"). This is the one place that maps between
-    them, so `None` never has to mean two different things in the same scope.
+    The config has three states (unset, N decimals, do not round); the rounding takes an int, or
+    None for "do not round".
     """
     if configured is None:
         return DEFAULT_VALUE_PRECISION
-    # bool BEFORE int, because bool is a subclass of int and `round(1.234, True)` is a legal call
-    # that quietly rounds to one decimal. `"value_precision": true` in a hand-edited streams.json
-    # is a mistake, not a request for one decimal.
+    # bool before int: bool is a subclass of int, and `round(1.234, True)` silently rounds to one
+    # decimal.
     if isinstance(configured, bool) or not isinstance(configured, int):
-        # Includes the float and the string forms — `2.0` and `"2"` both come back from json.load()
-        # looking close enough to right to be typed by accident, and `round(x, 2.0)` raises
-        # TypeError, which inside flatten_payload would cost a five-second reconnect per message.
-        # Falling back to the default keeps the stream writing; the warning is what makes the
-        # silence stop, because a precision that is quietly ignored is exactly the bug this whole
-        # setting exists to fix.
+        # Floats and strings (`2.0`, `"2"`) too: `round(x, 2.0)` raises TypeError, which would cost
+        # a reconnect per message. Fall back to the default and warn, so the ignored value shows.
         logger.warning(
             "[%s] Ignoring value_precision=%r: expected an integer. Falling back to %d decimals.",
             stream_id, configured, DEFAULT_VALUE_PRECISION)
@@ -88,48 +69,28 @@ def resolve_value_precision(configured, stream_id: str = "") -> Optional[int]:
 def _to_storable_float(value, precision: Optional[int] = DEFAULT_VALUE_PRECISION):
     """round(float(value), precision), or None for anything InfluxDB could not store anyway.
 
-    `precision=None` stores the number as it arrived — which is what Node-RED does for a value that
-    came out of json.loads() already numeric, and the only setting under which a calibration
-    coefficient like 0.00003618 survives the trip at all. Note that it has to be a branch and not
-    `round(num, precision)` with a None: `round(1.234, None)` is not "do not round", it returns the
-    INT 1, so passing the None straight through would turn every value into an integer.
+    `precision=None` stores the number as it arrived. It has to be a branch: `round(1.234, None)`
+    returns the int 1, not the unrounded float.
     """
     try:
         num = float(value)
         if precision is not None:
             num = round(num, precision)
     except (ValueError, OverflowError):
-        # ValueError is the ordinary case: a string that is not a number at all.
-        #
-        # OverflowError has two sources, and the rounding is INSIDE this guard because of the
-        # second one. float() raises it for an integer that does not fit a float, which json.loads()
-        # will happily parse at any length — and round() raises it too: `round(1.7e308, -308)` is
-        # "rounded value too large to represent". No stream can reach that through
-        # resolve_value_precision(), which maps every negative to None, but `precision` is a public
-        # parameter of this function, of to_number() and of flatten_payload(), and a negative
-        # ndigits is a meaningful argument in Python.
-        #
-        # Either way raising here would escape flatten_payload, escape the per-message block, be
-        # caught by the outer `except Exception` in _process_forever and cost a five-second
-        # reconnect — one device publishing a 400-digit number would throttle the whole stream.
+        # ValueError: a string that is not a number. OverflowError: float() of an integer too large
+        # for a float, or round() with a negative ndigits (`round(1.7e308, -308)`). Raising would
+        # escape flatten_payload and cost the stream a five-second reconnect.
         return None
     if not math.isfinite(num):
-        # NaN and the infinities arrive by three routes that all look ordinary: json.loads("NaN")
-        # and json.loads("Infinity") accept them by default, float("nan") parses the plain string
-        # a sensor with no reading publishes, and 1e400 in a payload overflows to inf. None of
-        # them can be stored: InfluxDB 1.x scans a field value that does not start with a digit or
-        # a sign as an invalid number and rejects the ENTIRE request body — so one such point
-        # costs the other 219 points batched with it, and then a full retry ladder against a 400
-        # that will never come back different. Dropping them here rewrites no history, because no
-        # value like this has ever reached the database.
+        # NaN and the infinities (json.loads("NaN"), float("nan"), 1e400) cannot be stored:
+        # InfluxDB 1.x rejects the whole request body over one, losing every point batched with it.
         return None
     return num
 
 
 def to_number(value, precision: Optional[int] = DEFAULT_VALUE_PRECISION):
-    # The two booleans do NOT go through the rounding, at any precision: 10 and 0 are markers this
-    # bridge invents, not measurements, and `round(10, 8)` would turn the int into a float and
-    # change the line protocol it writes from `value=10` to `value=10.0`.
+    # The booleans skip the rounding: 10 and 0 are markers, not measurements, and
+    # _to_storable_float() would turn `value=10` into `value=10.0`.
     if isinstance(value, bool):
         return 10 if value else 0
     if isinstance(value, (int, float)):
@@ -140,29 +101,19 @@ def to_number(value, precision: Optional[int] = DEFAULT_VALUE_PRECISION):
             return 10
         if low == "false":
             return 0
-        # A numeric string takes the same precision as a number would. Node-RED's bridge rounds
-        # exactly here and nowhere else, which is how the same reading ends up stored two different
-        # ways depending only on whether the device quoted it in its JSON.
+        # Rounded like a number, so a reading is stored the same way whether or not the device
+        # quoted it.
         return _to_storable_float(value, precision)
     return None
 
 
 def _is_a_number_we_refused(text: str) -> bool:
-    """True when float() reads this string as a number — i.e. to_number() dropped a NUMBER, not a word.
+    """True when float() reads `text` as a number: to_number() refused a number, not a word.
 
-    The difference decides whether `write_strings` may pick a value up. `to_number()` answers None
-    for two unrelated reasons: the payload is not a number at all ("Printing"), or it IS one and
-    `_to_storable_float()` threw it away as unstorable — "nan" and "inf", which a sensor with no
-    reading really does publish, and "1e400" or four hundred digits, which overflow to an infinity.
-    Those live on topics that carry floats the rest of the time, so writing them as string fields
-    would put a string into a field InfluxDB has already typed as a float: a 400 that costs the
-    entire batch of 220 points, classed permanent, with no retry. The drop is older than this
-    setting and stays.
-
-    float() of a STRING never raises OverflowError — it returns inf for a number too large — so
-    ValueError is the whole of what has to be caught here. _to_storable_float() also guards a second
-    source, round() with a negative ndigits, which a string CAN reach; it needs no handling here,
-    because such a payload is by definition one float() reads, so the answer is True either way.
+    `write_strings` must not pick those up: "nan", "inf" and overflowing literals live on topics
+    that otherwise carry floats, and a string in a float-typed field is a permanent 400 for the
+    whole batch. float() of a string returns inf instead of raising OverflowError, so ValueError is
+    all there is to catch.
     """
     try:
         float(text)
@@ -185,34 +136,18 @@ def flatten_payload(topic: str, payload, precision: Optional[int] = DEFAULT_VALU
             clean_topic = topic.replace(" ", "_").lower()
             yield clean_topic, num
         elif write_strings and isinstance(payload, str) and payload and not _is_a_number_we_refused(payload):
-            # Strictly the leftovers: this branch only ever sees a value to_number() has ALREADY
-            # refused, so a number, a numeric string and the "true"/"false" → 10/0 mapping keep
-            # writing exactly what they wrote yesterday whether the flag is on or off. Turning it on
-            # can add series, never change one — which is why the numbers to_number() refused as
-            # UNSTORABLE ("nan", "inf", an overflowing literal) are excluded here rather than
-            # stringified: see _is_a_number_we_refused() above.
-            #
-            # The VALUE is kept verbatim — only the topic is lowercased and space-stripped, as it has
-            # always been. "Printing" and "printing" are different states of a 3D printer, and this
-            # is a field value, not a measurement name: nothing downstream needs it normalised, and
-            # normalising it would silently merge two states into one in every dashboard.
-            #
-            # An empty string stays dropped, and that is not tidiness: clearing a retained topic is
-            # published as a zero-length payload, so writing it would turn every "this reading no
-            # longer exists" into a data point saying the state is "".
+            # Only values to_number() refused reach here, so this adds series and never changes one;
+            # refused numbers ("nan", "inf") stay dropped. The value is kept verbatim ("Printing"
+            # and "printing" are different states); an empty payload, which clears a retained
+            # topic, is dropped.
             clean_topic = topic.replace(" ", "_").lower()
             yield clean_topic, payload
 
 
 def make_line(measurement: str, value: Union[float, str], timestamp_ms: int) -> str:
-    # The backslash is replaced FIRST: doing it after the others would go back over the backslashes
-    # they just inserted and escape those too, turning `a,b` into `a\\,b` — an escaped backslash
-    # followed by a bare comma, which is the field separator again.
-    # The newline is the one that matters for safety: write_batch joins the batch with "\n", and a
-    # measurement name carrying a raw newline therefore injects whole extra line-protocol records
-    # into the request body — writes into any measurement the sender likes. Names are built from
-    # MQTT topics and from JSON keys inside the payload (flatten_payload), so the content is
-    # attacker-supplied by construction.
+    # Backslash first, or the backslashes the later replacements insert would be escaped again.
+    # Newlines are escaped because write_batch joins records with "\n" and names come from MQTT
+    # topics and payload keys: a raw newline would inject extra records.
     safe = (
         measurement.replace("\\", "\\\\")
         .replace(",", "\\,")
@@ -221,18 +156,9 @@ def make_line(measurement: str, value: Union[float, str], timestamp_ms: int) -> 
         .replace("\r", "\\r")
     )
     if isinstance(value, str):
-        # A string field is quoted, and inside the quotes line protocol escapes exactly two
-        # characters: the backslash and the double quote. Backslash FIRST for the same reason as
-        # above — escaping it afterwards would double the backslashes the quote rule just inserted
-        # and leave the quote unescaped again, closing the field early.
-        # The newline and the carriage return are the injection half, and they are the same hazard
-        # the measurement escaping already documents: write_batch joins the batch with "\n", so a
-        # raw newline inside a field value ends the record and makes everything after it a NEW
-        # line-protocol record — a write into any measurement whoever published the payload likes.
-        # A payload is attacker-supplied by construction.
-        # Note what that costs: InfluxDB reads only \\ and \" back inside a string field, so a value
-        # carrying a real newline is stored with the two characters `\n` in its place. Everything
-        # else survives byte for byte; a multi-line payload does not.
+        # Inside a quoted string field line protocol escapes only the backslash (replaced first, as
+        # above) and the double quote. Newlines are escaped against the same injection, so a value
+        # with a real newline is stored with the two characters `\n` in its place.
         safe_value = (
             value.replace("\\", "\\\\")
             .replace('"', '\\"')
@@ -243,20 +169,9 @@ def make_line(measurement: str, value: Union[float, str], timestamp_ms: int) -> 
     return f"{safe} value={value} {timestamp_ms}"
 
 
-# Non-2xx statuses worth sending the same body again for. Everything else that is not a 2xx is a
-# statement about the REQUEST — a rotated password (401), a dropped database (404), a value
-# InfluxDB's line parser refuses (400) — and the same bytes will get the same answer for as long as
-# the cause lasts. 429 and 5xx are the database being overloaded, restarting, or proxied by
-# something that is: a second later the identical body can succeed.
-#
-# This split assumes the bridge talks to InfluxDB DIRECTLY. influx_host/influx_port come from
-# streams.json and may well name a reverse proxy, and Traefik answers 404 — not 503 — for the
-# seconds a docker-provider backend is being recreated, which is exactly the outage the ladder
-# exists for. 404 is still classed as permanent on purpose: it also means "the database was
-# dropped", and 401 means "the password was rotated", and retrying those costs the whole budget
-# per batch, forever, in a loop that is not draining the broker queue while it waits. Losing one
-# batch to a proxy blip is bounded and shows up in `errors`; the other way round is not. Fix that
-# case at the proxy — make it answer 502/503 for a missing backend — not here.
+# Retried besides 5xx: an overloaded or restarting database. Other statuses (400, 401, 404)
+# describe the request, and the same body gets the same answer. A proxy that answers 404 for a
+# missing backend (Traefik does) is fixed at the proxy, by answering 502/503, not here.
 RETRY_AFTER_STATUSES = frozenset({429})
 
 
@@ -278,9 +193,8 @@ class InfluxWriter:
     async def write_batch(self, batch: list) -> bool:
         """batch: list of (measurement, value, timestamp_ms). True if InfluxDB stored it.
 
-        The bool-only shape is the contract every caller that does not retry is written against,
-        including the shutdown flush; write_batch_detailed() is the one to call when the answer is
-        going to be acted on.
+        For callers that do not retry, such as the shutdown flush; a retrying caller uses
+        write_batch_detailed().
         """
         stored, _worth_retrying = await self.write_batch_detailed(batch)
         return stored
@@ -288,12 +202,8 @@ class InfluxWriter:
     async def write_batch_detailed(self, batch: list) -> Tuple[bool, bool]:
         """batch: list of (measurement, value, timestamp_ms). Returns (stored, worth_retrying).
 
-        The second half exists because collapsing every non-2xx into one `False` makes the retry
-        ladder run against answers that cannot change. A rotated InfluxDB password or a deleted
-        database costs, per batch, one 10s aiohttp timeout plus the whole RETRY_BUDGET of a message
-        loop that is not draining the broker — and it does that for every batch until someone
-        notices. Same for a single NaN in a body InfluxDB parses as a whole: a permanent 400 on 220
-        good points.
+        worth_retrying is False for an answer that cannot change (a rotated password, a dropped
+        database, a 400), so the retry ladder does not spend its budget on it.
         """
         if not batch:
             return True, False

@@ -1,14 +1,9 @@
 #!/usr/bin/env python3
-"""Tests for src/api.py — the REST surface, the websocket and the static UI mount.
+"""Tests for src/api.py: the REST surface, the websocket and the static UI mount.
 
-Everything here runs through `fastapi.testclient.TestClient`, which drives the real ASGI app
-in-process, including its lifespan. Two isolations make that safe and both come from conftest.py:
-DATA_DIR points at a temporary directory, and the stream manager's lifecycle methods are recorders,
-so no test opens a socket to an MQTT broker.
-
-Streams are created with `enabled: false` throughout. That is not tidiness — `create_stream()` calls
-`manager.start_stream()` the moment `enabled` is true, and the app's lifespan does the same for
-every enabled stream it finds on disk at startup.
+TestClient drives the real ASGI app in-process, lifespan included. conftest.py points DATA_DIR at a
+temporary directory and replaces the manager's lifecycle methods with recorders. Streams are created
+with `enabled: false`: creating an enabled stream, or starting up with one on disk, starts it.
 """
 
 import asyncio
@@ -43,17 +38,10 @@ STREAM_BODY = {
 
 @pytest.fixture
 def client(data_dir, manager_calls):
-    """A client whose lifespan has really run — hence `with`, not a bare TestClient(app).
+    """A client whose lifespan runs: only `with TestClient(app)` triggers startup and shutdown.
 
-    Entering the context manager is what triggers startup and shutdown; a bare `TestClient(app)`
-    runs neither, so `manager.stop_all()` would never be exercised by anything in this file.
-
-    What this fixture does NOT cover is the startup branch that starts enabled streams: `data_dir`
-    hands every test an empty directory, so `load_streams()` inside the lifespan always returns `[]`
-    and the loop body never executes. That branch is covered by
-    `test_startup_starts_every_enabled_stream_it_finds_on_disk` and its negative twin below, which
-    seed streams.json BEFORE constructing their own client — the ordering is the whole point, and it
-    is why they cannot use this fixture.
+    The data directory starts empty, so startup finds no streams; the startup tests below seed
+    streams.json first and build their own client.
     """
     with TestClient(app) as test_client:
         yield test_client
@@ -76,12 +64,9 @@ def test_streams_are_empty_on_a_fresh_data_dir(client):
 
 
 def test_startup_starts_nothing_when_there_is_no_config(client, manager_calls):
-    """The lifespan ran (the fixture entered the context manager) and found nothing to start.
+    """Startup with no config starts nothing.
 
-    On its own this asserts almost nothing — an app that had no startup logic at all would pass it
-    too. It earns its place only as the negative half of a pair whose positive half is
-    `test_startup_starts_every_enabled_stream_it_finds_on_disk`: together they separate "started
-    nothing because there was nothing to start" from "never starts anything".
+    The negative half of `test_startup_starts_every_enabled_stream_it_finds_on_disk`.
     """
     assert manager_calls.started == []
 
@@ -89,28 +74,17 @@ def test_startup_starts_nothing_when_there_is_no_config(client, manager_calls):
 # ── startup: what the lifespan does with the config already on disk ───────────────────────────────
 
 def _seed_on_disk(**overrides):
-    """Write one stream into streams.json the way a previous run of the service would have left it.
-
-    Written through `save_streams` rather than by hand so that the file the lifespan reads back is
-    produced by the same serialiser production uses — a test fixture that drifted from the real
-    format would test the parser against a shape it never meets.
-    """
+    """Write one stream to streams.json with save_streams, the serialiser the service uses."""
     fields = dict(STREAM_BODY, id="stream-on-disk")
     fields.update(overrides)
     save_streams([StreamConfig(**fields)])
 
 
 def test_startup_starts_every_enabled_stream_it_finds_on_disk(data_dir, manager_calls):
-    """A restart has to bring the bridge back up by itself, and this is the only thing that does it.
+    """Startup starts every enabled stream it finds in streams.json.
 
-    Nothing else in the service ever re-reads streams.json: `create_stream` starts a stream because
-    the request said so, and `restart_stream` because a PUT did. After a container restart there is
-    no request — the streams that were running are only rows in a file, and if this loop does not
-    walk it nothing reconnects. MQTT does not buffer for an absent subscriber, so that is not a
-    delayed bridge, it is data that never existed.
-
-    This test constructs its own client instead of using the `client` fixture because the file has
-    to exist before the lifespan reads it, and the fixture is entered before the test body runs.
+    Nothing else re-reads the file, so after a container restart this is what reconnects the
+    streams. Its own client, because the file has to exist before the lifespan reads it.
     """
     _seed_on_disk(enabled=True)
 
@@ -120,9 +94,7 @@ def test_startup_starts_every_enabled_stream_it_finds_on_disk(data_dir, manager_
         assert [cfg.id for cfg in manager_calls.started] == ["stream-on-disk"]
         started = manager_calls.started[0]
 
-    # The stored config is handed over whole. Half of it is credentials, and a stream started with
-    # a default-constructed config would connect anonymously to port 1883 of nowhere and look
-    # "running" while writing nothing.
+    # The stored config is handed over whole, credentials included.
     assert started.mqtt_host == "mqtt.invalid"
     assert started.mqtt_user == "mqtt-user"
     assert started.mqtt_password == "mqtt-secret"
@@ -134,13 +106,7 @@ def test_startup_starts_every_enabled_stream_it_finds_on_disk(data_dir, manager_
 
 
 def test_startup_leaves_a_disabled_stream_on_disk_alone(data_dir, manager_calls):
-    """`enabled: false` is the only off switch a stream has, and it has to survive a restart.
-
-    A stream is disabled precisely so that it stops dialling a broker — someone else's broker, in
-    the common case, since these configs point at other people's installations. Starting it anyway
-    on the next deploy would reconnect a bridge its owner had switched off, with credentials that
-    may since have been revoked.
-    """
+    """`enabled: false` is the only off switch a stream has, and it has to survive a restart."""
     _seed_on_disk(enabled=False)
 
     with TestClient(app):
@@ -213,11 +179,10 @@ def test_put_on_an_unknown_id_returns_404(client):
 
 
 def test_a_stream_created_without_a_precision_reports_it_as_unset(client):
-    """The default has to come back as null and not as 2, or "unset" stops being distinguishable.
+    """An unset precision comes back as null, not as the resolved 2.
 
-    The UI prefills its form from this response. If the server answered with the resolved 2, then
-    opening and saving a stream would write an explicit `"value_precision": 2` into streams.json —
-    turning every edit into an opt-in to a key that an older image cannot read.
+    The UI prefills its form from this response, so a 2 here would be saved back as an explicit key
+    that an older image cannot read.
     """
     created = create(client)
 
@@ -240,11 +205,9 @@ def test_put_sets_a_precision_and_it_reaches_the_config_file(client, data_dir):
 
 
 def test_a_put_that_does_not_mention_the_precision_leaves_it_alone(client):
-    """Every other field is carried over on a partial PUT, and this one is not special.
+    """A partial PUT carries the stored precision over.
 
-    Worth its own test because the carry-over reads `body.get(k, getattr(existing, k))`: a field
-    whose stored value is None is exactly the case where a `body.get(k)` written without the
-    fallback would look like it worked.
+    Stored as 8, not None: with None, a `body.get(k)` missing its fallback would pass too.
     """
     created = create(client, value_precision=8)
 
@@ -267,12 +230,9 @@ def test_put_can_clear_a_precision_back_to_the_default(client, data_dir):
 
 # ── value_precision: what the API refuses to store ────────────────────────────────────────────────
 #
-# `StreamConfig` is a plain dataclass and `StreamConfig(**body)` checks no types at all, so every
-# value below used to be answered with 200, written into streams.json and echoed back by GET and by
-# the UI — while the stream went on rounding to two decimals, because the only validation there was
-# lived in `resolve_value_precision()` and only ran when a processor was constructed, i.e. at the
-# next restart. That is the exact defect this whole setting exists to remove: the operator asked for
-# one precision and the database got another, with nothing anywhere saying so.
+# `StreamConfig(**body)` checks no types, and resolve_value_precision() falls back to the default
+# for a non-integer, so without the API check each value below would be stored and shown while the
+# stream rounds to two decimals.
 
 REJECTED_PRECISIONS = [
     "8",     # the number typed into what the operator took for a text field
@@ -299,7 +259,7 @@ def test_post_refuses_a_precision_that_is_not_an_integer(client, bad):
 
 @pytest.mark.parametrize("bad", REJECTED_PRECISIONS, ids=REJECTED_IDS)
 def test_put_refuses_a_precision_that_is_not_an_integer(client, manager_calls, bad):
-    """The path the bug was actually reported on: PUT answered 200 and stored the string."""
+    """A refused PUT leaves the stored precision alone and does not restart the stream."""
     created = create(client, value_precision=8)
     manager_calls.restarted.clear()
 
@@ -316,13 +276,10 @@ def test_put_refuses_a_precision_that_is_not_an_integer(client, manager_calls, b
 
 @pytest.mark.parametrize("method", ["post", "put"])
 def test_a_precision_of_true_is_refused_and_not_read_as_one_decimal(client, method):
-    """The one bad value that would otherwise pass every plausible type check.
+    """`true` is refused, not stored as a precision of one decimal.
 
-    `bool` is a subclass of `int`, so `isinstance(True, int)` is True and `round(1.234, True)` is a
-    legal call that rounds to ONE decimal. Without the bool check placed before the int check,
-    `{"value_precision": true}` is not rejected and is not ignored either — it is silently accepted
-    as a precision of 1, which is the worst of the three outcomes: fewer decimals than the default
-    everyone else gets, on a stream nobody knows is configured that way.
+    bool is a subclass of int, so `isinstance(True, int)` holds and `round(x, True)` rounds to one
+    decimal; the bool check has to come before the int check.
     """
     if method == "post":
         response = client.post("/api/streams", json=dict(STREAM_BODY, value_precision=True))
@@ -335,8 +292,7 @@ def test_a_precision_of_true_is_refused_and_not_read_as_one_decimal(client, meth
         assert response.status_code == 422, response.text
         stored = load_streams()[0].value_precision
 
-    # Nothing was stored, and what the rounding would resolve out of that is the historical default
-    # — two decimals, not the one decimal `True` would have bought.
+    # Nothing was stored, so the stream rounds to the default two decimals, not to one.
     assert stored is None
     assert resolve_value_precision(stored) == DEFAULT_VALUE_PRECISION == 2
 
@@ -369,11 +325,8 @@ def test_a_body_with_no_precision_key_at_all_is_accepted(client):
 
 # ── write_strings: the flag that decides whether a status string is written at all ────────────────
 #
-# The processor resolves this field with `bool(...)` and `StreamConfig(**body)` checks no types, so
-# every truthy non-bool is a silent yes — `"false"` most of all, which is what a shell script or a
-# hand-written body spells it as. InfluxDB fixes a field's type on the first write, so a stream
-# flipped into string mode by accident does not write slightly different data, it gets whole batches
-# refused on every topic that ever carried a number.
+# The processor reads this field with `bool(...)`, so any truthy non-bool, `"false"` included, would
+# turn string mode on, and InfluxDB refuses whole batches on fields that already hold numbers.
 
 def test_a_stream_created_without_the_flag_reports_it_as_off(client):
     """Absent means the default, and the default is what every existing stream does."""
@@ -465,11 +418,9 @@ def test_put_refuses_a_write_strings_that_is_not_a_bool(client, manager_calls, b
 
 @pytest.mark.parametrize("method", ["post", "put"])
 def test_the_string_false_is_refused_rather_than_read_as_a_yes(client, method):
-    """The one bad value that would otherwise flip a production stream into string mode silently.
+    """The string "false" is refused rather than stored.
 
-    `bool("false")` is True — it is a non-empty string. Without the type check the API would answer
-    200, streams.json would read `"write_strings": "false"`, the UI checkbox would show it ticked
-    and the stream would start writing string fields into measurements that hold numbers.
+    `bool("false")` is True, so storing it would switch the stream into string mode.
     """
     if method == "post":
         response = client.post("/api/streams", json=dict(STREAM_BODY, write_strings="false"))
@@ -484,9 +435,8 @@ def test_the_string_false_is_refused_rather_than_read_as_a_yes(client, method):
 
 
 def test_a_body_with_no_write_strings_key_at_all_is_accepted(client):
-    """A curl one-liner written before this feature existed must keep working."""
-    # Asserted rather than filtered: the fixture does not carry the key today, and if someone ever
-    # adds it there this test would quietly stop being about a body that omits it.
+    """A body without the key is accepted, with the flag off."""
+    # Asserted rather than filtered, so the test fails if STREAM_BODY ever gains the key.
     assert "write_strings" not in STREAM_BODY
 
     response = client.post("/api/streams", json=STREAM_BODY)
@@ -515,11 +465,6 @@ def test_deleting_the_same_stream_twice_returns_404(client):
 # ── what the API asks the stream manager to do ────────────────────────────────────────────────────
 
 def test_creating_an_enabled_stream_asks_the_manager_to_start_it(client, manager_calls):
-    """The one place `enabled: true` is exercised, and only against a recorder.
-
-    With the real manager this call constructs a StreamProcessor and schedules a task that connects
-    to mqtt.invalid, retrying every five seconds for as long as the test session lives.
-    """
     created = create(client, enabled=True)
 
     assert [cfg.id for cfg in manager_calls.started] == [created["id"]]
@@ -527,14 +472,7 @@ def test_creating_an_enabled_stream_asks_the_manager_to_start_it(client, manager
 
 
 def test_creating_a_disabled_stream_starts_nothing(client, manager_calls):
-    """The negative half of the pair above: `if stream.enabled` has to be a real branch.
-
-    Alone this test is satisfied by an API that never starts anything; paired with
-    `test_creating_an_enabled_stream_asks_the_manager_to_start_it` it pins the condition, because no
-    single implementation of that `if` passes both unless it reads `enabled`. It matters because the
-    UI's "add stream" form defaults the checkbox off precisely so that a half-filled config can be
-    saved without dialling the broker it names.
-    """
+    """The negative half of the test above: `if stream.enabled` has to be a real branch."""
     create(client, enabled=False)
     assert manager_calls.started == []
 
@@ -578,12 +516,7 @@ def test_starting_an_unknown_stream_returns_404_and_starts_nothing(client, manag
 # ── stats ─────────────────────────────────────────────────────────────────────────────────────────
 
 class _StatsDouble:
-    """Occupies a slot in `manager._processors` and answers `get_stats()`. Nothing else.
-
-    A real StreamProcessor cannot stand in here: constructing one is harmless, but `manager` is a
-    singleton shared with the app, and the autouse `no_live_processors` fixture exists because a
-    processor left in it means a scheduled MQTT connection outliving the test that made it.
-    """
+    """Occupies a slot in `manager._processors` and answers `get_stats()`. Nothing else."""
 
     def __init__(self, stats):
         self._stats = stats
@@ -593,16 +526,10 @@ class _StatsDouble:
 
 
 def test_stats_reports_the_numbers_the_running_processors_report(client):
-    """/api/stats is the only window onto whether points are actually reaching InfluxDB.
+    """/api/stats answers 200 with an empty list, then with what each processor reports.
 
-    The endpoint is also the container's healthcheck target (see docker-compose.yml), which is why
-    the empty case has to be a 200 and not a 404 — that is the state right after a deploy onto a
-    fresh volume, and a healthcheck failing there restarts the container forever.
-
-    The second half is what makes this test more than a smoke check. An endpoint hardcoded to
-    `return []` satisfies the empty case perfectly, and would leave the UI showing a permanently
-    idle bridge — every counter zero, every stream apparently dead — while the bridge ran fine. So
-    the numbers a processor reports have to be observed coming back out of the response body.
+    The empty case is what the compose healthcheck sees after a fresh deploy; the second half
+    catches an endpoint that always returns [].
     """
     assert client.get("/api/stats").json() == []
 
@@ -620,32 +547,17 @@ def test_stats_reports_the_numbers_the_running_processors_report(client):
         assert response.status_code == 200
         assert response.json() == [stats]
     finally:
-        # Cleared here rather than left to `no_live_processors`: that fixture is a tripwire for
-        # tests that leak a processor, and a test tripping it deliberately would train the next
-        # reader to ignore it.
+        # Cleared here: no_live_processors fails any test that leaves a processor behind.
         manager._processors.pop("stream-1", None)
 
 
-# ── credentials in API responses: a decision, not an accident ─────────────────────────────────────
+# ── credentials in API responses ──────────────────────────────────────────────────────────────────
 
 def test_the_api_returns_stream_credentials_in_the_clear(client):
     """Every response carrying a stream carries its MQTT and InfluxDB passwords, on purpose.
 
-    This is the owner's decision, recorded here so that the next person to read a response body does
-    not file it as an oversight and "fix" it. The service is LAN-only: docker-compose publishes it
-    as `8111:8000`, there is no Traefik label, no TLS and no authentication anywhere in `src/api.py`
-    — deliberately, because there is nothing here to authenticate against and a login screen on a
-    single-user bridge is friction without a threat model behind it.
-
-    The passwords are in the responses because the UI needs them: `static/index.html` fills the edit
-    form from `GET /api/streams` and puts `f.mqtt_password` straight into the password input, so a
-    stream edited through the UI would otherwise have its credentials blanked on the first save.
-
-    If that policy ever changes — the service goes on a network it does not own, or gains a login —
-    this test goes red first, and it is the reminder that masking the field is not a one-line change
-    to the API. Two other places would have to move with it: `static/index.html` (lines 440 and 446)
-    stops being able to refill the form, and `ci/smoke.py` compares the POST echo against every key
-    of its own STREAM_BODY (line 548), passwords included, so the gate would fail the build.
+    The UI fills its edit form from GET /api/streams, so masked passwords would be blanked on the
+    next save. The service is LAN-only and has no authentication.
     """
     created = create(client)
     assert created["mqtt_password"] == "mqtt-secret"
@@ -670,28 +582,17 @@ def test_the_index_page_is_served_at_the_root(client):
 
 
 def test_an_unknown_path_is_404_and_not_the_index_page(client):
-    """`StaticFiles(html=True)` does NOT fall back to index.html on a miss — it looks for a
-    `404.html`, does not find one in static/, and raises 404. Asserted rather than assumed, because
-    the opposite (an SPA-style catch-all) is what most people expect of `html=True`, and a fallback
-    would turn every mistyped API path into a 200 carrying a page of HTML."""
+    """A miss is a 404: `StaticFiles(html=True)` looks for a 404.html, not for index.html.
+
+    A catch-all fallback would answer every mistyped API path with a 200 and a page of HTML.
+    """
     response = client.get("/no-such-page")
     assert response.status_code == 404
     assert "<h1>mqtt2influx</h1>" not in response.text
 
 
 def test_the_api_routes_win_over_the_static_mount_at_the_root(client):
-    """The mount is on "/" and would swallow every API path if it were registered before them.
-
-    Starlette matches routes in registration order and a Mount at "/" matches everything, so the
-    `app.mount(...)` at the bottom of src/api.py is load-bearing *because* it is at the bottom.
-    Move it above the decorated routes and `GET /api/streams` becomes a lookup for a file named
-    `api/streams` in static/ — a 404, with no error anywhere pointing at the reason.
-
-    Asserted structurally as well as behaviourally. Every other test in this file would also go red
-    on a reordering, so a bare status check here adds nothing they do not already say; what this one
-    contributes is naming the cause, and pinning the ordering as a property of `app.routes` rather
-    than as a side effect noticed downstream.
-    """
+    """Starlette matches in registration order, so the catch-all mount on "/" has to come last."""
     response = client.get("/api/streams")
     assert response.status_code == 200
     # The API answers as the API, not as a file that happened to be found under static/.
@@ -724,11 +625,8 @@ def test_the_websocket_sends_a_snapshot_frame_immediately(client):
 async def _wait_until(predicate, timeout=5.0):
     """Poll `predicate` on the app's own event loop until it holds, or fail the test.
 
-    Every wait in the websocket tests below has a deadline for the same reason: the frames come from
-    background tasks, and the failure mode of a task that was never created is silence.
-    `receive_json()` blocks with no timeout of its own, so without a deadline somewhere a broken
-    `sender()` or `stats_pusher()` would hang the whole run instead of reddening one test — and a
-    suite that hangs teaches people to kill it rather than to read it.
+    `receive_json()` has no timeout, so this deadline is what turns a missing background task into
+    a failure instead of a hung suite.
     """
     deadline = time.monotonic() + timeout
     while not predicate():
@@ -737,21 +635,12 @@ async def _wait_until(predicate, timeout=5.0):
 
 
 def test_the_websocket_delivers_events_broadcast_while_it_is_connected(client, monkeypatch):
-    """The snapshot is one frame; everything after it comes through `sender()`, and it is the log.
+    """An event broadcast after the snapshot reaches the client through `sender()`.
 
-    A processor calls `on_event` per flush, per message and per error, `_broadcast` fans those out
-    into the per-connection queue, and `sender()` is the only thing that ever takes them out again.
-    Drop that task and the dashboard still connects, still paints its initial numbers and then sits
-    frozen — no live log, no flush counter moving — with no error on either side to say why.
-
-    `websocket.portal` is what runs a coroutine on the event loop the ASGI app is running on;
-    TestClient drives the app from a thread of its own, and `Queue.put_nowait` called from this
-    thread would resolve a future belonging to that loop without waking it, so the frame would
-    arrive by luck rather than by design.
+    `websocket.portal` runs the broadcast on the app's event loop: TestClient runs the app in a
+    thread of its own, and `put_nowait` from this thread would not wake that loop.
     """
-    # This connection's own queue, not `manager._ws_queues` at large: the manager is a singleton and
-    # the set is shared, so a predicate written over all of it would be answering a question about
-    # whatever previous tests happened to leave behind.
+    # This connection's own queue: the manager is a singleton, and `_ws_queues` is shared.
     connection_queues = []
     real_add_ws_queue = manager.add_ws_queue
 
@@ -782,12 +671,8 @@ def test_the_websocket_delivers_events_broadcast_while_it_is_connected(client, m
 class _ImpatientAsyncio:
     """The real asyncio module with `sleep` shortened, and nothing else changed.
 
-    `stats_pusher()` waits two seconds between pushes. Waiting them out for real would put four
-    times the entire suite's runtime into a single test, and a suite that slow is one people start
-    running less often. src.api resolves `asyncio.sleep` through its module global at call time, so
-    swapping that global for this proxy shortens the interval without touching the asyncio module
-    itself; every other attribute the endpoint reaches for — Queue, create_task — is forwarded to
-    the real one, so the code under test is otherwise unmodified.
+    `stats_pusher()` waits two seconds between pushes. src.api looks `asyncio` up as a module
+    global, so swapping it for this proxy shortens the wait without touching asyncio itself.
     """
 
     def __getattr__(self, name):
@@ -799,15 +684,9 @@ class _ImpatientAsyncio:
 
 
 def test_the_websocket_keeps_pushing_stats_after_the_snapshot(client, monkeypatch):
-    """The counters on the dashboard are refreshed by this task and by nothing else.
+    """`stats_pusher()` keeps sending stats frames after the snapshot, even when no events arrive.
 
-    `sender()` only ever forwards events, and an event is emitted per flush — so on a stream that is
-    connected but quiet, or one whose broker went silent, no event arrives and the last snapshot
-    would stay on screen forever. `stats_pusher()` is what makes "0 msgs in the last minute" visible
-    as a change rather than as an absence.
-
-    The second call to `get_all_stats` is the marker waited for: the first one is the snapshot the
-    endpoint sends inline, so a second can only have come from the pusher's own loop.
+    The second `get_all_stats` call is the marker: the first is the snapshot sent inline.
     """
     monkeypatch.setattr(api, "asyncio", _ImpatientAsyncio())
     real_get_all_stats = manager.get_all_stats

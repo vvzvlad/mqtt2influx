@@ -1,17 +1,9 @@
 #!/usr/bin/env python3
-"""Everything between an MQTT message and the body of an InfluxDB write request.
+"""Tests for src/influx_writer.py: from an MQTT message to the body of an InfluxDB write.
 
-Four pure functions and one HTTP call, and every one of them handles input supplied by whoever can
-publish to the broker: `contains_excluded` decides what is thrown away, `to_number` decides what
-counts as a measurement at all, `flatten_payload` turns a JSON document into topic/value pairs and
-`make_line` renders them as line protocol. `InfluxWriter.write_batch` is the only part that touches
-the network, and it is driven here against a session double — a test that opened a socket would be
-a test that fails on an aeroplane.
-
-`make_line()` builds the measurement half of an InfluxDB line-protocol record out of an MQTT topic —
-and, via `flatten_payload()`, out of the KEYS of whatever JSON arrived on that topic. Both are
-supplied by whoever can publish to the broker, so every character with a meaning in line protocol
-has to be neutralised here or it is neutralised nowhere.
+Topics, payload keys and payloads come from whoever can publish to the broker, so every character
+with a meaning in line protocol is neutralised here or nowhere. write_batch runs against a session
+double; one cancellation test uses a loopback server.
 """
 
 import asyncio
@@ -57,27 +49,22 @@ def test_a_carriage_return_in_a_measurement_is_escaped():
 
 
 def test_the_backslash_is_escaped_before_the_other_characters():
-    # Input is the four characters  a \ , b.
-    # Escaping the backslash LAST would go back over the backslash the comma rule had just inserted
-    # and double it, leaving the comma preceded by an even number of backslashes — unescaped again,
-    # and a field separator in the middle of a measurement name. Order is the whole fix here, and
-    # only an input containing both characters can tell the two orders apart.
+    # Input is the four characters  a \ , b. Escaping the backslash last would double the one the
+    # comma rule inserts and leave the comma unescaped; only an input with both characters tells
+    # the two orders apart.
     assert make_line("a\\,b", 1.0, 5) == "a\\\\\\,b value=1.0 5"
 
 
 def test_make_line_names_its_timestamp_parameter_in_the_unit_it_receives():
-    # write_batch() passes milliseconds and sends precision=ms; the parameter used to be called
-    # timestamp_ns, which says the opposite and invites the next reader to "fix" the caller by
-    # multiplying by a million. Passing it by keyword is what pins the name.
+    # write_batch() passes milliseconds and sends precision=ms. Passing by keyword pins the name.
     assert make_line(measurement="m", value=1.0, timestamp_ms=7) == "m value=1.0 7"
 
 
 # ── make_line: string fields ──────────────────────────────────────────────────────────────────────
 #
-# A stream with `write_strings` on hands this function the MQTT payload itself, so the FIELD half of
-# the record is now attacker-supplied exactly like the measurement half already was. Line protocol
-# quotes a string field and escapes two characters inside the quotes; the newline is the one that
-# decides whether a payload can write into measurements nobody configured.
+# With `write_strings` on, the field value is the MQTT payload itself, as untrusted as the topic.
+# Line protocol quotes a string field and escapes the backslash and the double quote inside it; the
+# newline is escaped too, or a payload could write into measurements nobody configured.
 
 def test_a_string_value_is_written_as_a_quoted_field():
     """The whole point of the feature, as InfluxDB receives it."""
@@ -85,12 +72,9 @@ def test_a_string_value_is_written_as_a_quoted_field():
 
 
 def test_a_numeric_value_is_still_written_unquoted():
-    """The regression guard for 604 million points: the number path is untouched, byte for byte.
+    """A number is written unquoted, as a float field.
 
-    An unsuffixed number is a float field and a quoted one is a string field — they are different
-    field TYPES to InfluxDB, and it fixes a field's type on the first write. Quoting a number here
-    would not write the same series differently, it would make every existing numeric field refuse
-    the batch it arrived in.
+    InfluxDB fixes a field's type on the first write, so a quoted number would be refused.
     """
     assert make_line("m", 1.5, 5) == "m value=1.5 5"
     assert make_line("m", 10, 5) == "m value=10 5"
@@ -115,20 +99,16 @@ def test_a_carriage_return_inside_a_string_value_is_escaped():
 
 
 def test_the_backslash_in_a_string_value_is_escaped_before_the_quote():
-    # Input is the four characters  a \ " b.
-    # Escaping the backslash LAST would go back over the backslash the quote rule had just inserted
-    # and double it, leaving the quote preceded by an even number of backslashes — unescaped again,
-    # and the end of the field value in the middle of the payload. Order is the whole fix, and only
-    # an input containing both characters can tell the two orders apart.
+    # Input is the four characters  a \ " b. Escaping the backslash last would double the one the
+    # quote rule inserts and close the field early; only an input with both characters tells the
+    # two orders apart.
     assert make_line("m", 'a\\"b', 5) == 'm value="a\\\\\\"b" 5'
 
 
 def test_a_newline_in_a_string_payload_cannot_inject_a_second_record():
-    """The reason the escaping exists at all, stated as the attack rather than as the output.
+    """A raw newline in a string payload would end the record and start one the publisher wrote.
 
-    `write_batch` joins the batch with "\\n". A raw newline inside a field value therefore ENDS the
-    record, and everything after it in the payload is read by InfluxDB as a new line-protocol
-    record — a write into any measurement whoever can publish to the broker chooses.
+    `write_batch` joins the batch with "\\n".
     """
     line = make_line("m", "x\nspoofed value=1 1", 5)
 
@@ -140,24 +120,17 @@ def test_a_newline_in_a_string_payload_cannot_inject_a_second_record():
 
 @pytest.mark.parametrize("substring", EXCLUDED_SUBSTRINGS)
 def test_every_listed_substring_really_filters_a_topic(substring):
-    """The list is only a filter if every entry in it is reachable.
+    """Every entry in EXCLUDED_SUBSTRINGS filters a topic that contains it.
 
-    Parametrised over the constant rather than over a copied literal, so an entry added to
-    EXCLUDED_SUBSTRINGS is tested the moment it is added — and, more to the point, an entry that
-    never matches anything (a leading slash too many, a renamed vendor prefix) cannot sit in the
-    list looking like protection it is not providing. These topics are excluded because they carry
-    firmware versions, serial numbers and Home Assistant discovery documents: high-cardinality
-    strings that `to_number` discards anyway, after the whole payload has been parsed and walked.
+    Parametrised over the constant, so a new entry is covered as soon as it is added.
     """
     assert contains_excluded("/devices/x{}/controls/y".format(substring)) is True
 
 
 def test_a_topic_matching_nothing_in_the_list_is_kept():
-    """The other half of the filter: it has to let the actual measurements through.
+    """The other half of the filter: it lets the actual measurements through.
 
-    `any()` over an empty list is False, but `any()` over a list containing "" would be True for
-    every topic on the broker — the filter would silently drop the entire stream, and the stats
-    would show messages received and nothing sent.
+    An empty string in the list would match every topic and drop the whole stream.
     """
     assert contains_excluded("/devices/wb-msw-v3/controls/Temperature") is False
 
@@ -173,20 +146,16 @@ def test_the_filter_matches_a_substring_anywhere_not_just_a_prefix():
 def test_a_boolean_becomes_ten_or_zero():
     """10 rather than 1 so that a switch drawn on the same axis as a percentage stays visible.
 
-    The bool branch has to come FIRST: `isinstance(True, int)` is True in Python, so an `int` check
-    placed above it would swallow booleans and write 1/0 instead — every relay graph in the UI would
-    flatten against the bottom of a chart shared with a 0..100 sensor.
+    The bool branch comes first: bool is a subclass of int, and the int branch would store 1.0/0.0.
     """
     assert to_number(True) == 10
     assert to_number(False) == 0
 
 
 def test_the_strings_true_and_false_are_read_as_booleans_whatever_their_case():
-    """MQTT payloads are bytes; a broker that publishes `true` sends five characters, not a bool.
+    """A text payload `true` or `false`, in any case, counts as a boolean.
 
-    Half the devices on a Wiren Board bus publish `true`/`false` as plain text and never as JSON, so
-    without this branch `float("true")` raises, `to_number` returns None and the topic silently
-    produces no points at all — a switch that simply never appears in InfluxDB.
+    Without this branch the string fails float() and the topic writes no points at all.
     """
     assert to_number("true") == 10
     assert to_number("TRUE") == 10
@@ -202,12 +171,10 @@ def test_a_numeric_string_is_parsed():
 
 
 def test_a_non_numeric_string_is_dropped_rather_than_raising():
-    """Returning None is what makes a text payload a no-op instead of an exception in the read loop.
+    """A text payload is dropped with None, not an exception.
 
-    An exception here would escape `flatten_payload`, escape the per-message block in
-    `_process_forever`, be caught by its outer `except Exception`, and cost a five-second reconnect
-    sleep — during which the broker keeps publishing to a subscriber that is not there. One device
-    sending a status string would throttle the entire stream.
+    An exception would reach the outer handler in `_process_forever` and cost a five-second
+    reconnect, during which the broker publishes to a subscriber that is not there.
     """
     assert to_number("online") is None
     assert to_number("") is None
@@ -225,16 +192,10 @@ def test_a_number_is_rounded_to_two_decimals():
 
 
 def test_rounding_to_two_decimals_flattens_small_readings_to_zero():
-    """Documented, not endorsed: this is lossy, and the loss is silent.
+    """The default rounding stores anything below 0.005 in magnitude as 0.0; it is not dropped.
 
-    `round(value, 2)` is applied to every numeric payload, so anything below 0.005 in magnitude is
-    stored as exactly 0.0 — and it is stored, not dropped, because 0.0 is not None. A current
-    sensor reading 0.003 A, a rainfall gauge in millimetres, a power factor delta: each writes a
-    flat zero line into InfluxDB that looks like a working sensor reporting nothing.
-
-    The behaviour is pinned here as-is because changing it would rewrite the meaning of the
-    historical series already in production. This test exists so that the next person to notice a
-    suspiciously flat graph finds the cause written down instead of rediscovering it.
+    Lossy and silent: such a sensor draws a flat zero line. A stream that needs small values sets
+    value_precision.
     """
     assert to_number(0.001) == 0.0
     assert to_number(0.004) == 0.0
@@ -247,41 +208,26 @@ def test_rounding_to_two_decimals_flattens_small_readings_to_zero():
     1e400,                                       # overflows to inf on the way in
 ])
 def test_a_value_influxdb_cannot_parse_is_dropped_like_a_status_string(value):
-    """NaN and the infinities are not a rounding curiosity, they are a batch-killer.
+    """NaN and the infinities are dropped: `value=nan` makes InfluxDB 1.x reject the whole body.
 
-    `make_line` would render `value=nan`, and InfluxDB 1.x scans a field value that starts with
-    neither a digit nor a sign as an invalid number and rejects the WHOLE request body. One sensor
-    publishing "nan" — which is what a probe with no reading publishes — therefore costs the other
-    219 points batched with it, and then a full retry ladder against a 400 that will answer the
-    same way forever. Dropping them here rewrites no history: no value like this has ever been
-    stored, because InfluxDB never accepted one.
+    A probe with no reading publishes "nan", which would cost every point batched with it.
     """
     assert to_number(value) is None
 
 
 def test_an_integer_too_large_for_a_float_is_dropped_rather_than_raising():
-    """json.loads() parses an integer of any length; float() refuses one that does not fit.
+    """json.loads() parses an integer of any length, and float() raises OverflowError on one.
 
-    The OverflowError has no handler between here and `_process_forever`'s outer `except
-    Exception`, so it would be counted as a stream error and cost a five-second reconnect sleep —
-    during which the broker publishes to a subscriber that is not there. One device with a
-    400-digit number in its payload would throttle the entire stream.
+    Uncaught, it would cost the stream a five-second reconnect.
     """
     assert to_number(10 ** 400) is None
 
 
 def test_a_bool_yields_a_python_int_while_a_number_yields_a_float():
-    """The two branches return different Python types, and that leaks all the way out.
+    """A bool yields an int and a number a float, so the body reads `value=10` or `value=1.5`.
 
-    `10` and `10.0` render differently in the line body and as different JSON types on the /ws feed,
-    so a topic that alternates between `true` and `1.5` produces `value=10` on one record and
-    `value=1.5` on the next.
-
-    Worth being precise about the consequence, because it is smaller than it looks: InfluxDB 1.x
-    line protocol treats an unsuffixed number as a float and reserves integers for the explicit `i`
-    suffix, which `make_line` never emits — so both records land in the same float field and there
-    is NO field type conflict at the database. The difference is visible in the request body and in
-    the websocket payload the UI renders, and nowhere else.
+    Both are float fields to InfluxDB 1.x, which reserves integers for the `i` suffix that
+    make_line never emits, so the difference shows only in the body and on the /ws feed.
     """
     assert type(to_number(True)) is int
     assert type(to_number(1.5)) is float
@@ -292,20 +238,13 @@ def test_a_bool_yields_a_python_int_while_a_number_yields_a_float():
 
 # ── value_precision: how many decimals reach InfluxDB ─────────────────────────────────────────────
 #
-# Context, because these tests are guarding two different things at once. Two decimals used to be
-# hardcoded into `_to_storable_float`, and the numbers above pin what that did to 604 million
-# points already in the database. The setting below lets ONE stream ask for something else without
-# any other stream noticing — so half of this section is about the new behaviour and half is about
-# proving the old behaviour is still what you get when nobody asks.
+# One stream can ask for other rounding without any other stream noticing, so half of this section
+# checks the setting and half checks that a stream that sets nothing still gets two decimals.
 
 def test_the_default_is_still_two_decimals_when_no_precision_is_given():
-    """The regression guard for every stream in production, and the reason the default is not None.
+    """With no precision given, a number is rounded to two decimals.
 
-    Two streams carry real traffic — a Wirenboard install at 134 million messages and a kiln bridge
-    at 4.9 million points — and neither of them will mention precision in streams.json. If the
-    default here ever became "no rounding", both would silently change what they write mid-series:
-    same measurement, same field, more decimals from one point onward. Nothing errors, nothing is
-    counted, and every dashboard built on the old numbers keeps drawing.
+    Existing streams set none, so another default would silently change their series mid-way.
     """
     assert to_number(10.74805) == 10.75
     assert to_number(5.678) == 5.68
@@ -313,24 +252,13 @@ def test_the_default_is_still_two_decimals_when_no_precision_is_given():
 
 
 def test_a_stream_can_ask_for_more_decimals():
-    """The kiln's ADC readings, which is what the whole setting was added for.
-
-    `sensor/adc_raw` publishes 10.74805 and the Node-RED bridge it is being migrated off stores
-    exactly that. Through the old hardcoded rounding it arrives as 10.75 — three digits of a
-    calibrated analogue reading gone.
-    """
     assert to_number(10.74805, 5) == 10.74805
     assert to_number(10.83213, 5) == 10.83213
     assert to_number(1.00722098, 8) == 1.00722098
 
 
 def test_a_precision_of_none_stores_the_number_exactly_as_it_arrived():
-    """The Node-RED parity mode: a number that came out of json.loads() is written untouched.
-
-    Node-RED rounds only the numeric STRINGS it sees (`parseFloat(n.toFixed(2))`) and passes an
-    already-parsed JSON number straight through. This is that behaviour, and it is the only setting
-    under which a kiln calibration coefficient survives at all.
-    """
+    """With precision None, a number that came out of json.loads() is written untouched."""
     assert to_number(0.00003618, None) == 0.00003618
     assert to_number(10.74805, None) == 10.74805
     assert to_number(1.00722098, None) == 1.00722098
@@ -338,16 +266,10 @@ def test_a_precision_of_none_stores_the_number_exactly_as_it_arrived():
 
 
 def test_a_fixed_precision_cannot_rescue_a_calibration_coefficient():
-    """Why "more decimals" is not a substitute for "do not round", spelled out with the real value.
+    """More decimals are no substitute for no rounding on a small coefficient.
 
-    `sensor/calibration_coeff_a` on kiln UE-932C8C4AEA2F reads 0.00003618. Two decimals flatten it
-    to a stored 0.0 — not dropped, STORED, so the series looks like a working sensor reading zero.
-    Five decimals, the obvious "surely that is enough", still destroy it: the value only has four
-    leading zeros and rounding to five leaves 4e-05, a 10% error masquerading as precision.
-
-    The point is that the right precision depends on the magnitude of a coefficient nobody controls
-    — the next kiln calibrates to 1e-6 and eight decimals fail too — so the answer for that stream
-    is the no-rounding mode, not a bigger number.
+    0.00003618 is stored as 0.0 at two decimals and as 4e-05 (a 10% error) at five; the precision it
+    needs depends on a magnitude nobody controls.
     """
     assert to_number(0.00003618) == 0.0
     assert to_number(0.00003618, 5) == 4e-05
@@ -356,11 +278,9 @@ def test_a_fixed_precision_cannot_rescue_a_calibration_coefficient():
 
 
 def test_the_two_booleans_ignore_the_precision_completely():
-    """10 and 0 are markers this bridge invents, not readings, so there is nothing to round.
+    """10 and 0 are markers, not readings: no precision rounds them or turns them into floats.
 
-    They also have to stay Python ints at every precision: `round(10, 8)` returns a float, and that
-    would change the body from `value=10` to `value=10.0` for every boolean topic on a stream that
-    only asked for more decimals on its analogue ones.
+    `_to_storable_float` would turn `value=10` into `value=10.0`.
     """
     for precision in (DEFAULT_VALUE_PRECISION, 0, 5, 8, None):
         assert to_number(True, precision) == 10
@@ -373,13 +293,7 @@ def test_the_two_booleans_ignore_the_precision_completely():
 
 
 def test_a_numeric_string_takes_the_same_precision_as_a_number():
-    """Whether a device quotes its reading in JSON must not decide how much of it is kept.
-
-    A quoted "10.74805" and a bare 10.74805 are the same measurement, and they go through the same
-    `_to_storable_float` — the branch above them in `to_number` only decides how the value got
-    there. Worth pinning because Node-RED, the bridge being migrated off, does exactly the opposite:
-    it rounds the string form and leaves the parsed form alone.
-    """
+    """Whether a device quotes its reading in JSON must not decide how much of it is kept."""
     assert to_number("10.74805") == 10.75
     assert to_number("10.74805", 5) == 10.74805
     assert to_number("10.74805", None) == 10.74805
@@ -397,11 +311,7 @@ def test_whole_numbers_come_through_every_precision_unchanged():
 
 
 def test_a_precision_of_zero_rounds_to_whole_numbers():
-    """0 is a real setting and not a synonym for "unset", which is why null is what means unset.
-
-    If an empty field in the UI ever arrived as 0 instead of null, a stream would quietly start
-    storing integers — so this pins that 0 does something specific and different from the default.
-    """
+    """0 is a real setting, whole numbers, and not a synonym for "unset"; null means unset."""
     assert to_number(10.74805, 0) == 11.0
     assert to_number(5.4, 0) == 5.0
 
@@ -412,14 +322,7 @@ def test_a_precision_of_zero_rounds_to_whole_numbers():
     1e400,
 ])
 def test_a_value_influxdb_cannot_parse_is_still_dropped_when_nothing_is_rounded(value):
-    """The `math.isfinite` guard has to survive the no-rounding path, or it stops guarding.
-
-    Skipping `round()` moved that check to the other side of a branch. If it had been skipped along
-    with the rounding, a stream in no-rounding mode would render `value=nan` into the body and
-    InfluxDB 1.x would reject the ENTIRE request — the other 219 points batched with it included,
-    followed by a retry ladder against a 400 that never changes. That is a bigger failure than the
-    rounding this setting exists to avoid.
-    """
+    """The `math.isfinite` check also runs on the no-rounding path."""
     assert to_number(value, None) is None
 
 
@@ -432,16 +335,8 @@ def test_an_integer_too_large_for_a_float_is_still_dropped_when_nothing_is_round
 def test_a_precision_that_makes_the_rounding_overflow_drops_the_value_instead_of_raising():
     """`round()` raises OverflowError too, which is why the call sits inside the same try.
 
-    `round(1.7e308, -308)` is "rounded value too large to represent". No stream configured through
-    the UI can reach it — `resolve_value_precision()` maps every negative to None — but `precision`
-    is a public parameter of `_to_storable_float`, of `to_number` and of `flatten_payload`, and a
-    negative `ndigits` is a meaningful argument in Python, so the three functions are callable this
-    way by anything that skips the resolver.
-
-    Out of `flatten_payload` the exception has no handler until the outer `except Exception` in
-    `_process_forever`: one message would be counted as a stream error and cost a five-second
-    reconnect, during which the broker publishes to a subscriber that is not there and the points
-    are gone for good.
+    `round(1.7e308, -308)` overflows. resolve_value_precision() never returns a negative, but the
+    three functions take a precision from any caller.
     """
     assert _to_storable_float(1.7e308, -308) is None
     assert to_number(1.7e308, -308) is None
@@ -455,24 +350,14 @@ def test_a_precision_that_makes_the_rounding_overflow_drops_the_value_instead_of
 ])
 @pytest.mark.parametrize("precision", [None, 0, 2, 8])
 def test_the_finite_check_still_runs_after_the_rounding_guard(value, precision):
-    """`math.isfinite` has to stay AFTER the try block, at every precision including no rounding.
+    """`math.isfinite` runs after the try block, at every precision including no rounding.
 
-    Rounding leaves NaN and the infinities exactly as they were — `round(inf, 2)` is `inf`, it does
-    not raise — so nothing in the guard above catches them. If the check were folded into the try,
-    or skipped along with the rounding on the no-rounding path, `make_line` would render
-    `value=nan` and InfluxDB 1.x would reject the ENTIRE request body: the other 219 points batched
-    with it included, then a retry ladder against a 400 that never answers differently.
+    `round(inf, 2)` is inf and does not raise, so nothing in the try catches NaN or the infinities.
     """
     assert _to_storable_float(value, precision) is None
 
 
 def test_the_precision_reaches_every_leaf_of_a_nested_document():
-    """One MQTT message becomes many points, and the setting is per stream, not per point.
-
-    The kiln publishes its whole state as one JSON document, so if the precision stopped at the
-    first level of recursion the coefficients — which are exactly the values that need it — would
-    be the ones that lost it.
-    """
     payload = {
         "sensor": {"adc_raw": 10.74805, "calibration_coeff_a": 0.00003618},
         "kiln_temp": 1125.12,
@@ -491,13 +376,9 @@ def test_the_precision_reaches_every_leaf_of_a_nested_document():
 
 
 def test_no_rounding_renders_a_small_coefficient_as_scientific_notation():
-    """What actually goes into the request body, because `str(3.618e-05)` is not `0.00003618`.
+    """`str(3.618e-05)` is not `0.00003618`, and the body carries the scientific form.
 
-    InfluxDB 1.x parses a float field with Go's ParseFloat and documents `1.e+78` as a valid value,
-    so this is accepted — and it is not new either: `str()` already produced this form for large
-    numbers under the old hardcoded rounding. Pinned because it is the one visible difference
-    between what the config says and what crosses the wire, and the place to look first if a
-    no-rounding stream ever starts collecting 400s.
+    InfluxDB 1.x parses a float field with Go's ParseFloat, which accepts it.
     """
     assert make_line("m", to_number(0.00003618, None), 1) == "m value=3.618e-05 1"
     assert make_line("m", to_number(10.74805, None), 1) == "m value=10.74805 1"
@@ -506,23 +387,13 @@ def test_no_rounding_renders_a_small_coefficient_as_scientific_notation():
 # ── resolve_value_precision: three config states, two rounding arguments ──────────────────────────
 
 def test_an_unset_precision_resolves_to_the_historical_two_decimals():
-    """Both spellings of "unset" — an absent key and an explicit null — land on the same default.
-
-    They have to. Every JSON producer treats them as interchangeable, so if they meant different
-    things then a UI that sends `"value_precision": null` for a cleared box and a config generator
-    that omits the key would configure the same stream two different ways.
-    """
+    """Both spellings of "unset", an absent key and an explicit null, land on the same default."""
     assert resolve_value_precision(None) == DEFAULT_VALUE_PRECISION
     assert resolve_value_precision(None) == 2
 
 
 def test_a_negative_precision_resolves_to_no_rounding_at_all():
-    """The sentinel, and the reason it is a negative number rather than a null.
-
-    `null` is what a cleared form field and an omitted key both produce, so spending it on "do not
-    round" would make the dangerous state the easy one to reach by accident. A negative number has
-    to be typed on purpose. Any negative value means it; -1 is the spelling the UI writes.
-    """
+    """Any negative precision means no rounding; -1 is the spelling the UI writes."""
     assert resolve_value_precision(RAW_VALUE_PRECISION) is None
     assert resolve_value_precision(-1) is None
     assert resolve_value_precision(-7) is None
@@ -537,16 +408,9 @@ def test_a_non_negative_precision_is_passed_through_as_the_number_of_decimals():
 
 @pytest.mark.parametrize("configured", [2.0, "2", "", "eight", [], {}])
 def test_a_precision_that_is_not_an_integer_falls_back_to_the_default(configured, caplog):
-    """streams.json is hand-edited, and `round(x, 2.0)` is a TypeError inside the message loop.
+    """A non-integer precision falls back to the default, with a warning naming the stream.
 
-    Raising there would escape flatten_payload, be caught by `_process_forever`'s outer `except
-    Exception` and cost a five-second reconnect — per message, for as long as the typo lasts, on a
-    subscription that buffers nothing while it is away. So a malformed setting degrades to the
-    default rather than taking the stream down.
-
-    It degrades LOUDLY, though: a precision that is silently ignored is the exact failure this
-    setting was added to fix, and a stream that looks configured but is not is worse than one that
-    obviously is not.
+    `round(x, 2.0)` is a TypeError, which would cost a reconnect per message.
     """
     with caplog.at_level(logging.WARNING, logger="src.influx_writer"):
         assert resolve_value_precision(configured, "stream-id") == DEFAULT_VALUE_PRECISION
@@ -569,14 +433,7 @@ def test_a_boolean_precision_is_rejected_rather_than_read_as_one_decimal(caplog)
 
 
 def test_the_resolved_none_is_never_handed_to_round():
-    """The trap this whole two-vocabulary split exists to avoid.
-
-    `round(1.234, None)` does not mean "do not round" — it is the same as `round(1.234)` and returns
-    the INT 1. So the no-rounding mode cannot be implemented by passing the resolved value straight
-    into `round()`; it has to be a branch that skips the call. If that ever regresses, every value
-    on a no-rounding stream becomes a whole number — the opposite of what was asked for, and far
-    more destructive than the two decimals it replaced.
-    """
+    """No rounding is a branch that skips round(): `round(1.234, None)` returns the int 1."""
     assert round(1.234, None) == 1
     assert type(round(1.234, None)) is int
     # The real path, through the same resolved None:
@@ -591,12 +448,7 @@ def test_a_scalar_payload_yields_one_pair_named_after_the_topic():
 
 
 def test_a_nested_object_is_expanded_into_a_path_per_leaf():
-    """One MQTT message carrying a document has to become one point per number inside it.
-
-    Without the recursion the whole dict reaches `to_number`, which returns None for a dict, and the
-    message produces nothing — a device that reports its state as JSON would be invisible while the
-    stats counted its messages as received.
-    """
+    """One MQTT message carrying a document becomes one point per number inside it."""
     payload = {"outer": {"inner": 1.5}, "flat": 2}
 
     assert sorted(flatten_payload("devices/x", payload)) == [
@@ -606,20 +458,16 @@ def test_a_nested_object_is_expanded_into_a_path_per_leaf():
 
 
 def test_keys_beginning_with_an_underscore_are_skipped_along_with_everything_under_them():
-    """`_`-prefixed keys are the convention for a payload's own metadata, and it is metadata that
-    blows up cardinality: `_id`, `_timestamp`, `_meta` change on every single message. Skipping the
-    key skips its whole subtree — a nested `_meta` object contributes nothing at all, not just no
-    top-level field."""
+    """`_`-prefixed keys are a payload's own metadata (`_id`, `_meta`), which changes on every
+    message; skipping the key skips its whole subtree."""
     payload = {"temp": 21.0, "_id": 7, "_meta": {"seq": 1, "src": {"deep": 2}}}
 
     assert list(flatten_payload("devices/x", payload)) == [("devices/x/temp", 21.0)]
 
 
 def test_the_assembled_topic_is_lowercased_and_has_its_spaces_replaced():
-    """A space is a field separator in line protocol and `make_line` escapes it, so an unnormalised
-    key would reach InfluxDB as `Living\\ Room` — a measurement name with a backslash in it, and a
-    second series for what is the same sensor as `living_room`. Case is folded for the same reason:
-    InfluxDB measurement names are case-sensitive, so `Temp` and `temp` are two graphs."""
+    """Otherwise `Living Room` and `living_room` would be two series, and so would `Temp` and
+    `temp`: measurement names are case-sensitive, and a space reaches InfluxDB escaped."""
     assert list(flatten_payload("Home/Living Room", {"Temp Now": 21.0})) == [
         ("home/living_room/temp_now", 21.0)
     ]
@@ -634,41 +482,31 @@ def test_a_topic_that_already_ends_in_a_slash_does_not_get_a_second_one():
 
 
 def test_values_that_are_not_numbers_are_dropped_and_the_rest_of_the_document_survives():
-    """One unparseable field must not cost the other fields in the same message.
-
-    Yielding nothing for the whole payload — or raising — would mean a device that reports a status
-    string alongside its readings loses the readings too.
-    """
+    """One unparseable field must not cost the other fields in the same message."""
     payload = {"temp": 21.0, "status": "online", "name": None, "readings": [1, 2]}
 
     assert list(flatten_payload("devices/x", payload)) == [("devices/x/temp", 21.0)]
 
 
 def test_a_json_array_payload_produces_nothing():
-    """Lists are not recursed into — `to_number` returns None for one and the message is dropped.
+    """Lists are not recursed into: `to_number` returns None for one, so nothing is written.
 
-    Pinned because it is a silent hole rather than an error: a device publishing `[1, 2, 3]` counts
-    as received, is not counted as filtered, and writes no points. If array payloads ever have to be
-    supported, this is the test that has to change, and it names where.
+    Silent: the message counts as received, not as filtered.
     """
     assert list(flatten_payload("devices/x", [1, 2, 3])) == []
 
 
-# ── write_strings: the payloads that used to be dropped ───────────────────────────────────────────
+# ── write_strings: non-numeric payloads as string fields ──────────────────────────────────────────
 #
-# Half of this section is the new behaviour and half is the proof that it is ONLY new behaviour.
-# The flag is per stream and defaults to off, and the branch it opens sits behind `to_number()` —
-# so a value the number parser accepts can never reach it, and no series that exists today can
-# change shape because someone ticked a box on a different stream.
+# The flag is per stream and off by default, and its branch only sees what `to_number()` refused,
+# so a value the number parser accepts is written the same way with the flag on or off.
 
 def test_a_non_numeric_string_is_still_dropped_when_the_flag_is_off():
-    """The default, and what every stream in production keeps doing."""
     assert list(flatten_payload("data/gcode/status", "Printing")) == []
     assert list(flatten_payload("data/gcode/status", "Printing", write_strings=False)) == []
 
 
 def test_a_non_numeric_string_is_yielded_when_the_flag_is_on():
-    """The reported case: `/data/gcode/status` publishes "Printing" and it was never written."""
     assert list(flatten_payload("data/gcode/status", "Printing", write_strings=True)) == [
         ("data/gcode/status", "Printing")]
 
@@ -717,12 +555,10 @@ def test_an_empty_payload_is_dropped_whether_or_not_the_flag_is_on(flag):
     ("False", 0),
 ])
 def test_a_value_the_number_parser_accepts_is_untouched_by_the_flag(payload, expected):
-    """The invariant, and the only one that matters to the streams already running.
+    """A value `to_number()` accepts is written the same way with the flag on.
 
-    `to_number()` runs FIRST and the new branch only sees what it refused. If that order were ever
-    reversed — or if the string branch were widened to "any str" — then `"12"` would stop being 12.0
-    and `"true"` would stop being 10 on any stream with the flag on: a field-type conflict against
-    the numbers already in the database, which InfluxDB answers by refusing the whole batch.
+    The string branch only sees what `to_number()` refused; otherwise `"12"` would be written as a
+    string into a float-typed field, and InfluxDB refuses the whole batch over that.
     """
     off = list(flatten_payload("devices/x", {"v": payload}))
     on = list(flatten_payload("devices/x", {"v": payload}, write_strings=True))
@@ -735,24 +571,19 @@ def test_a_value_the_number_parser_accepts_is_untouched_by_the_flag(payload, exp
 @pytest.mark.parametrize("payload", ["nan", "NaN", "inf", "-inf", "Infinity", "1e400", "9" * 400])
 @pytest.mark.parametrize("flag", [False, True])
 def test_a_number_the_bridge_refuses_to_store_is_dropped_rather_than_stringified(payload, flag):
-    """The other half of the invariant, and the one that costs a batch when it breaks.
+    """A number `to_number()` refused (NaN, an infinity, an overflow) is not written as a string.
 
-    `to_number()` answers None for two unrelated reasons, and only one of them is a string: these
-    payloads ARE numbers, dropped by `_to_storable_float()` because InfluxDB cannot store them —
-    "nan" is what a sensor with no reading publishes, and the long literals overflow to an infinity.
-    They arrive on topics that carry floats the rest of the time, so writing them as string fields
-    would put a string into a field already typed as a float: a permanent 400 that takes the whole
-    batch of 220 points with it, and no retry. The flag must not reach them.
+    These arrive on topics that otherwise carry floats, and a string in a float-typed field is a
+    permanent 400 for the whole batch.
     """
     assert list(flatten_payload("devices/x/temp", payload, write_strings=flag)) == []
 
 
 @pytest.mark.parametrize("value", [None, [1, 2], 21.456, "12", True])
 def test_only_a_string_can_take_the_new_path(value):
-    """The flag does not make every dropped payload storable — a null and a list stay dropped.
+    """The flag does not make every dropped payload storable: a null and a list stay dropped.
 
-    The numbers and the numeric string are in the list for the other direction: they are yielded, but
-    as NUMBERS, so nothing here ever comes back quoted.
+    The numbers and the numeric string are yielded, but as numbers, never as strings.
     """
     yielded = list(flatten_payload("devices/x", {"v": value}, write_strings=True))
 
@@ -822,9 +653,8 @@ def _writer_with_fake_session(response=None, **overrides):
 
 
 async def test_a_newline_in_a_measurement_cannot_inject_extra_records_into_the_batch_body():
-    # The batch is serialised with "\n".join(...), so an unescaped newline inside a measurement name
-    # is not a formatting blemish — it closes the current record and opens one the publisher wrote,
-    # which is a write into any measurement it names. Three points in, three records out.
+    # The batch is joined with "\n", so an unescaped newline in a measurement name would close the
+    # record and open one the publisher wrote. Three points in, three records out.
     writer, session = _writer_with_fake_session()
     batch = [
         ("home/temp", 21.5, 1),
@@ -845,13 +675,7 @@ async def test_a_newline_in_a_measurement_cannot_inject_extra_records_into_the_b
 
 
 async def test_an_empty_batch_succeeds_without_going_near_the_network():
-    """The interval timer fires every second whether or not a message arrived.
-
-    `_flush` returns early on an empty batch today, but `write_batch` is the one that must not
-    depend on that: an HTTP round trip per second per idle stream is a request InfluxDB has to
-    parse and answer for no reason, and an empty body is a 400 from some versions. Returning True
-    also matters — False would mark `last_flush_ok` false and count an error on every quiet second.
-    """
+    """An empty batch is stored without a request: True, so no caller counts it as an error."""
     writer, session = _writer_with_fake_session()
 
     assert await writer.write_batch([]) is True
@@ -861,9 +685,7 @@ async def test_an_empty_batch_succeeds_without_going_near_the_network():
 @pytest.mark.parametrize("status", [200, 204])
 async def test_the_two_statuses_influxdb_answers_with_both_count_as_written(status):
     """204 is what InfluxDB 1.x returns from /write on success; 200 is what a proxy in front of it
-    may normalise that to. Treating either as a failure would send the whole batch through the retry
-    ladder and then count it as lost — points that were in fact stored, reported as errors, while
-    the message loop stalls for up to RETRY_BUDGET seconds against a database that is working."""
+    may normalise that to."""
     writer, _session = _writer_with_fake_session(_FakeResponse(status=status))
 
     assert await writer.write_batch([("m", 1.0, 1)]) is True
@@ -871,9 +693,7 @@ async def test_the_two_statuses_influxdb_answers_with_both_count_as_written(stat
 
 @pytest.mark.parametrize("status", [400, 401, 404, 413, 500, 503])
 async def test_any_other_status_is_a_failed_write(status):
-    """False is what triggers the retry ladder in `_write_with_retries` and, failing that, the error
-    counter the UI shows. Returning True on a 401 or a 404 — a rotated password, a dropped database
-    — would show a stream running cleanly while every point it produced went nowhere."""
+    """Any other status is False: a 401 or a 404 must not look like a stream running cleanly."""
     writer, _session = _writer_with_fake_session(_FakeResponse(status=status, text="boom"))
 
     assert await writer.write_batch([("m", 1.0, 1)]) is False
@@ -885,14 +705,10 @@ async def test_any_other_status_is_a_failed_write(status):
     aiohttp.ClientPayloadError("truncated response"),
 ])
 async def test_a_network_failure_is_a_failed_write_and_not_an_exception(error):
-    """The exception has to stop here. `_flush` awaits this from two places — the message loop and
-    the interval timer — and neither wraps it: an escaping error kills the timer task in silence,
-    or costs a five-second reconnect on the read loop. An InfluxDB restart is routine; losing the
-    MQTT subscription because of one is not.
+    """A network error is returned as False, not raised.
 
-    Note what the broad `except Exception` deliberately does NOT swallow: `asyncio.CancelledError`
-    is a BaseException, so the RETRY_BUDGET timeout in `_write_with_retries` and a shutdown can
-    still cut an in-flight write short.
+    Raised, it would cost the message loop a five-second reconnect. CancelledError is a
+    BaseException, so the RETRY_BUDGET timeout and a shutdown still cut a write short.
     """
     writer, _session = _writer_with_fake_session(_ExplodingResponse(error))
 
@@ -902,9 +718,7 @@ async def test_a_network_failure_is_a_failed_write_and_not_an_exception(error):
 async def test_the_write_is_addressed_to_the_databases_write_endpoint_in_milliseconds():
     """`precision=ms` has to match the timestamps `make_line` is handed.
 
-    InfluxDB defaults to nanoseconds when no precision is given, so dropping this parameter does not
-    fail — it reads a millisecond timestamp as nanoseconds and files every point at 1970-01-20. The
-    write succeeds, the API reports success, and the data is simply not where anyone looks for it.
+    Without it InfluxDB reads milliseconds as nanoseconds and files every point in January 1970.
     """
     writer, session = _writer_with_fake_session(host="influx.example", port=8087, database="metrics")
 
@@ -937,10 +751,7 @@ async def test_a_failure_that_a_second_attempt_could_fix_says_so(status):
 async def test_a_failure_that_will_answer_the_same_way_forever_says_so(status):
     """A rotated password, a dropped database, a NaN the line parser refuses.
 
-    Collapsed into a bare `False`, each of these ran the whole ladder: one 10s aiohttp timeout plus
-    the full RETRY_BUDGET per batch, spent by a message loop that is meanwhile taking nothing out
-    of the broker's queue — roughly 15 seconds per 220 points, on every batch, until a human
-    noticed. The answer was guaranteed identical every time.
+    The same body gets the same answer; a retry would only spend RETRY_BUDGET.
     """
     writer, _session = _writer_with_fake_session(_FakeResponse(status=status, text="boom"))
 
@@ -967,18 +778,14 @@ async def test_an_empty_batch_is_stored_without_a_request_and_without_a_retry():
     aiohttp.ClientPayloadError("truncated response"),
 ])
 async def test_a_network_failure_is_always_worth_repeating(error):
-    """Nothing about the request was ever judged — it did not arrive. Classifying a refused
-    connection or a DNS blip as permanent would drop the batch on the first blip, which is the bug
-    the ladder was added to fix."""
+    """Nothing about the request was ever judged: it did not arrive."""
     writer, _session = _writer_with_fake_session(_ExplodingResponse(error))
 
     assert await writer.write_batch_detailed([("m", 1.0, 1)]) == (False, True)
 
 
 async def test_write_batch_stays_a_plain_bool_over_the_detailed_answer():
-    """The bool shape is what the shutdown flush and every writer double in the suite are written
-    against. Widening it would be a silent change to a contract nothing else in the codebase
-    declares, so it is pinned here rather than assumed."""
+    """The shutdown flush and the writer doubles in the suite expect a plain bool."""
     writer, _session = _writer_with_fake_session(_FakeResponse(status=204))
     assert await writer.write_batch([("m", 1.0, 1)]) is True
 
@@ -989,23 +796,11 @@ async def test_write_batch_stays_a_plain_bool_over_the_detailed_answer():
 # ── a cancellation is not a failed write ──────────────────────────────────────────────────────────
 
 async def test_a_cancellation_leaves_the_real_writer_instead_of_becoming_a_failed_write():
-    """The one test in this file that opens a socket, and it has to.
+    """A cancelled write raises CancelledError instead of answering (False, ...).
 
-    Everything the shutdown path rescues rests on a detail of `write_batch_detailed` that is invisible
-    from the outside: it catches `Exception`, and `asyncio.CancelledError` is a `BaseException`, so a
-    cancellation walks straight through it. That is what lets `_flush` see the cancellation at all —
-    and `_flush` is the only thing that puts the in-flight batch back into `self._batch` before the
-    final flush goes looking for it. Widen that handler to `BaseException` (an easy edit to make: the
-    module carries `# pylint: disable=broad-exception-caught`, and "catch everything" reads like the
-    same intent) and the cancelled write instead answers `(False, ...)`. The retry ladder then keeps
-    sleeping and re-sending after a swallowed cancellation, the task never ends, `stop()` waits out
-    the whole grace period, and up to BATCH_SIZE points are dropped with no error counted.
-
-    Not one test in the rest of the suite would notice: every processor test drives a `FakeWriter`,
-    so the real writer never runs under a cancellation anywhere else. Hence a real aiohttp request
-    against a real listener — a loopback server that accepts the connection and then answers nothing,
-    which is what an InfluxDB wedged mid-restart looks like. Mocking aiohttp would prove the double
-    re-raises, which is not the claim.
+    `_flush` has to see the cancellation to put the in-flight batch back for the final flush. The
+    processor tests use a FakeWriter, so this runs real aiohttp against a loopback server that
+    accepts the connection and answers nothing.
     """
     accepted = asyncio.Event()
     peers = []

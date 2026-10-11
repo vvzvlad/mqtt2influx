@@ -1,26 +1,11 @@
 #!/usr/bin/env python3
-"""Shared fixtures.
+"""Shared fixtures: nothing writes to the real DATA_DIR and nothing opens a socket.
 
-Two things have to be true of every test in this suite, and both are arranged here rather than
-repeated in each test file.
-
-**Nothing writes to the real DATA_DIR.** `src/config.py` reads `DATA_DIR` from the environment once,
-at import, into a module-level name, and `_config_path()` looks that name up on every call — so
-rebinding `src.config.DATA_DIR` redirects every read and write, including the ones reached through
-`src.api`, which imported the CRUD helpers by reference. Without the redirect the suite would default
-to `/app/data`: the production path, and on a developer's machine a directory it may well be able to
-create.
-
-**Nothing opens a socket.** `src/stream_manager.py` exposes a module-level singleton `manager`, and
-`src.api` holds a reference to that same object. `manager.start_stream()` constructs a
-`StreamProcessor` and schedules a task that connects to the MQTT broker in the stream's config —
-which in a test means a made-up hostname, a five-second retry loop and a suite whose runtime depends
-on DNS. The `manager_calls` fixture replaces the three lifecycle methods with recorders, so a test
-can assert that the API *asked* for a stream to be started without anything actually starting.
-
-`is_running()` is deliberately left real: it answers from `manager._processors`, which the recorders
-never populate, so the `running: false` that GET /api/streams reports is an observation about the
-real manager rather than about a stub.
+`data_dir` rebinds `src.config.DATA_DIR`, which `_config_path()` looks up on every call, so the CRUD
+helpers `src.api` imported are redirected too. `manager_calls` replaces the manager's lifecycle
+methods with recorders, so a test can assert that the API asked for a stream to start without one
+starting. `is_running()` stays real: it answers from `manager._processors`, which the recorders
+never populate.
 """
 
 import pytest
@@ -34,31 +19,18 @@ from src.stream_manager import manager
 def no_dotenv(monkeypatch):
     """Keep a developer's own .env out of the suite.
 
-    `src/settings.py` names `.env` in its `SettingsConfigDict`, and that path is RELATIVE — it
-    resolves against the working directory, which for `make test` is the repository root, which is
-    exactly where `make env` puts the file. `src/mqtt_processor.py` builds a FRESH `Settings()` on
-    every call rather than reusing the module-level singleton, so the file would be re-read during
-    the run and not merely at import.
-
-    The result without this fixture is a suite whose answers depend on an untracked file: a
-    developer with `BATCH_SIZE=220` in their .env fails
-    `test_the_module_constants_fall_back_to_the_documented_defaults`, which unsets the variable
-    precisely to observe the DEFAULT, and CI — where no .env exists — passes. Tests have to be a
-    statement about the code, not about the machine.
-
-    Autouse, and it edits `model_config` rather than deleting the file, because the point is that
-    every test in the suite is unaffected by whatever happens to be on disk. A real environment
-    variable still wins over the file in production; that precedence is untouched here.
+    `env_file` is relative to the working directory, the repository root under `make test`, and
+    src/mqtt_processor.py builds a fresh Settings() per call, so a BATCH_SIZE in .env would change
+    what the default-checking tests see, while CI, with no .env, would pass.
     """
     monkeypatch.setitem(Settings.model_config, "env_file", None)
 
 
 @pytest.fixture
 def data_dir(tmp_path, monkeypatch):
-    """Point src.config at a throwaway directory for the duration of one test.
+    """Point src.config at a throwaway directory for one test.
 
-    The directory is deliberately NOT created here: `_config_path()` is supposed to create it on
-    first use, and several tests below depend on that being true of a path that does not exist yet.
+    Not created here: `_config_path()` creates it on first use, and tests check that.
     """
     path = tmp_path / "data"
     monkeypatch.setattr(config, "DATA_DIR", str(path))
@@ -101,10 +73,8 @@ def manager_calls(monkeypatch):
 def no_live_processors():
     """Fail any test that left a real StreamProcessor behind.
 
-    The recorders above are opt-in per test, so this is the backstop for the case they were not
-    requested: a processor in the singleton means a real MQTT connection attempt was scheduled, and
-    it would outlive the test that made it and leak into the next one. Checked before AND after, so
-    the test that gets blamed is the one that did it.
+    The recorders are opt-in, so a test without them can schedule a real MQTT connection that
+    outlives it. Checked before and after, so the test that did it is the one that fails.
     """
     assert manager._processors == {}, "a previous test left a live stream processor behind"
     yield

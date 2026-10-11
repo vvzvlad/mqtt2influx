@@ -121,27 +121,6 @@ entire configuration of the service**: lose it and every stream is gone. See the
 particular, `DATA_DIR` and the mount point are two halves of one fact and have to move together, in
 a single stack update.
 
-Where it is MOUNTED depends on how old the deployment is, and the image copes with both without
-being told:
-
-- mounted at `/app/data` (with `DATA_DIR` set to match, or left to the default) — the current shape;
-- mounted at `/data` with no environment variables at all — the older stacks. The image declares no
-  `ENV DATA_DIR`, precisely so that "nothing was chosen" stays visible inside the container:
-  `entrypoint.sh` then falls back to `/data` when there is no `streams.json` at `/app/data` **and
-  `/data` exists as a directory** (`[ -d /data ]`), and logs a warning saying the deployment should
-  set `DATA_DIR` explicitly.
-
-  **The signal is the MOUNT, not a file on it, and that distinction is the whole fix.** This image
-  never creates `/data`, so the directory being there at all is what says a volume was bound there.
-  A test for the legacy *file* (`[ -e /data/streams.json ]`) looks equivalent and is not: a
-  legacy-shaped stack whose volume holds no `streams.json` **yet** — one just created, one restored
-  empty, one whose operator has not saved a stream since the migration — fails it, comes up on
-  `/app/data`, and writes the operator's first stream into the container's writable layer, where the
-  next automatic image update deletes it. Everything answers 200 and the healthcheck stays green
-  throughout. That regression has shipped twice, `ci/smoke.py` check (q) exists to catch the third,
-  and `[ -d /data ]` is therefore not a redundant widening to be "simplified" away. Setting
-  `DATA_DIR` is still the right thing to do — the fallback is a safety net, not a configuration.
-
 ## HTTP API
 
 | Method | Path | What it does |

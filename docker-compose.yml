@@ -25,54 +25,31 @@
 #
 # Deploy from a prebuilt image — a `build:` here, where present, is for running locally.
 #
-# NAMING: the repository, this directory, the service, the container, the Portainer stack and the
-# image all use the same name, mqtt2influx. That is not cosmetic here — see the volume note below.
+# NAMING: the repository, the service, the container, the Portainer stack and the image are all
+# named mqtt2influx; the volume note below depends on it.
 #
-# WHAT THIS SERVICE IS: a bridge that subscribes to MQTT, flattens whatever arrives into InfluxDB
-# line protocol and writes it in batches, plus a small web UI to configure and watch the streams.
-# Its workload is continuous and high-rate, and MQTT does not buffer for a subscriber that is not
-# connected: every second the container is down is points that are gone for good rather than points
-# that arrive late. Downtime here is DATA LOSS, not lag — that is the property to size a redeploy
-# around, whatever the deployment.
+# A bridge from MQTT into InfluxDB, with a web UI to configure and watch the streams. MQTT does not
+# buffer for a subscriber that is not connected, so downtime here is data loss, not lag.
 
-# The stack joins an EXISTING network rather than creating its own. `external: true` means compose
-# will not create it and will fail loudly if it is missing, which is the right failure: silently
-# creating an empty network of the same name would detach this container from everything else on
-# the host that expects to reach it there.
+# An existing network: with `external: true` compose fails if it is missing instead of creating an
+# empty one that would cut this container off from the services on it.
 networks:
   docker_main_net:
     external: true
 
-# THE VOLUME NAME IS LOAD-BEARING AND THE ARITHMETIC BELOW IS THE WHOLE REASON THIS COMMENT EXISTS.
+# The volume holds streams.json, the service's whole configuration (every stream and its
+# credentials); an empty volume is a bridge that writes nothing.
 #
-# All of this service's configuration — every stream, with its MQTT and InfluxDB hosts, credentials,
-# topic filters and prefixes — lives in ONE file, streams.json, on this volume. There is no database
-# and no environment-variable fallback: an empty volume is a bridge that writes nothing and a UI
-# that shows an empty list.
+# The key is `data`: compose prefixes it with the project name, which Portainer takes from the stack
+# name, giving `mqtt2influx_data`. A key of `mqtt2influx_data` would ask for
+# `mqtt2influx_mqtt2influx_data`, a new, empty volume.
 #
-# The key here is `data`, NOT `mqtt2influx_data`. Compose prefixes a non-external volume key with the
-# project name, and Portainer uses the STACK name as the project name: `mqtt2influx` + `_` + `data`
-# = `mqtt2influx_data`, so the key `data` is what asks for that volume. Writing `mqtt2influx_data`
-# as the key would ask instead for `mqtt2influx_mqtt2influx_data` — a brand-new, EMPTY volume — and
-# the redeploy would come up looking healthy with every stream gone. Which volume any given
-# deployment actually carries is a question for that deployment, never for this file.
+# `DATA_DIR` in `environment:` and the `- data:/app/data` mount are two halves of one fact: moving
+# one without the other makes the app write into the container's writable layer, which the next
+# image update deletes. Change both in one StackUpdate.
 #
-# CHANGING THE MOUNT POINT — say from `/data` to `/app/data` — IS A REMOUNT, NOT A MIGRATION.
-# It is the SAME named volume (`mqtt2influx_data`) with the same bytes in it, appearing at a
-# different path inside the container. Nothing is copied, nothing is converted, and there is
-# nothing to back up beyond the usual: the only thing that changes is where the container looks.
-#
-# What DOES have to happen atomically is the pair below — the `DATA_DIR` line in `environment:` and
-# the `- data:/app/data` line in `volumes:`. They are two halves of one fact and a deploy that moves
-# one without the other is silent data loss, in either direction:
-#   * bind moved, DATA_DIR left behind -> the app writes to the old path, which is now an unmounted
-#     directory in the container's writable layer. It comes up healthy, shows an empty stream list,
-#     and the next image update deletes whatever was saved into it.
-#   * DATA_DIR moved, bind left behind -> exactly the same, at the other path.
-# So change both in ONE StackUpdate. Never edit the mount and the variable in two passes.
-#
-# The corollary: renaming the Portainer stack detaches the data just as effectively. If that is ever
-# needed, pin the volume first — `external: true` plus `name: mqtt2influx_data`.
+# Renaming the stack detaches the data the same way; pin the volume first (`external: true` plus
+# `name: mqtt2influx_data`).
 volumes:
   data:
 
@@ -80,103 +57,50 @@ services:
   mqtt2influx:
     image: gitea.vvzvlad.xyz/projects/mqtt2influx:latest
     container_name: mqtt2influx
-    # `always`, not `unless-stopped`. The two only differ after a host reboot or a docker daemon
-    # restart: `unless-stopped` leaves a container that somebody once stopped by hand switched off,
-    # and nothing announces that. For a bridge whose downtime is lost points rather than late ones,
-    # silently staying down after a reboot is the exact failure worth ruling out.
+    # `always`, not `unless-stopped`: after a host reboot or a daemon restart, `unless-stopped`
+    # silently leaves down a container that was once stopped by hand.
     restart: always
-    # How long docker waits between the SIGTERM and the SIGKILL when this container is stopped or
-    # recreated — which, with `io.portainer.update.enable` below, is something an updater does on
-    # its own every time :latest moves. The DEFAULT IS 10 s and it is not enough here.
-    #
-    # The arithmetic, and note that it is PER DEPLOYMENT rather than per stream: SIGTERM reaches the
-    # python process (that is what the gosu construction in the Dockerfile is for), uvicorn shuts the
-    # app down through its lifespan, and that calls manager.stop_all() — which stops every stream AT
-    # ONCE, through asyncio.gather. So what has to fit in this window is the slowest single stream,
-    # not the sum of them.
-    #
-    # One stream's worst case is two ten-second waits, in this order and against an InfluxDB and a
-    # broker that have both stopped answering:
-    #   1. the cancellation unwinds `async with aiomqtt.Client(...)`, whose __aexit__ waits for the
-    #      disconnect acknowledgement — bounded by the `timeout=10` that client is constructed with
-    #      in src/mqtt_processor.py. This is spent BEFORE the final flush has begun.
-    #   2. the final flush itself: ONE HTTP write, no retry ladder, bounded by ClientTimeout(total=10)
-    #      in src/influx_writer.py.
-    # Twenty seconds, plus uvicorn's own shutdown, and 30 s is that with margin. At the default of
-    # 10 s the SIGKILL would land while step 1 was still running and every stream's batch would be
-    # dropped without a write ever having been attempted — the one loss that is silent, because the
-    # process is gone before it could log anything.
-    #
-    # So do NOT scale this with the number of streams: they wait out their timeouts in parallel, and
-    # a grace period sized as "10 s per stream" only lengthens every deploy that meets a hung
-    # InfluxDB. It costs nothing on a healthy stop either — the process exits as soon as it is done
-    # and docker does not wait out the remainder.
+    # Docker's default 10 s is too short. manager.stop_all() stops every stream in parallel, and one
+    # stream's worst case is the MQTT disconnect wait (MQTT_TIMEOUT, 10 s) followed by the final
+    # flush (ClientTimeout 10 s); 30 s covers that with margin and does not scale with the streams.
     stop_grace_period: 30s
-    # The container STARTS as root — /entrypoint.sh needs it to chown this volume, whose contents an
-    # earlier root-running image left owned by root — and immediately drops to uid 1000 with gosu.
-    # `no-new-privileges` blocks only the setuid/setgid path back UP, so it costs that drop nothing;
-    # what it stops is the app process regaining root through some setuid binary a future base-image
-    # bump happens to ship. Do NOT add a `user:` override here: it would take root away before the
-    # entrypoint could repair the volume, and the entrypoint would then refuse to start rather than
-    # come up unable to write its configuration.
+    # The entrypoint starts as root to chown the volume, then drops to uid 1000 with gosu;
+    # `no-new-privileges` only blocks a way back up through setuid binaries. Do not add a `user:`
+    # override: it skips the chown, and the entrypoint refuses to start on a volume it cannot write.
     security_opt:
       - no-new-privileges:true
     networks:
       - docker_main_net
     ports:
-      # Published straight onto the host's LAN address, deliberately: this stack does NOT go through
-      # Traefik and has no TLS router. The UI is reached as http://<host>:8111 from inside the
-      # network only. Changing the left-hand side breaks every bookmark; the right-hand side is the
-      # app's own port and follows PORT in main.py.
+      # Straight onto the host's LAN address, no Traefik: the UI is http://<host>:8111. The
+      # right-hand side is the app's port (PORT, default 8000).
       - "8111:8000"
     environment:
-      # Read once at import time by src/mqtt_processor.py, so a change here needs a container
-      # restart, not just a reload. They bound the write batch: flush after BATCH_SIZE points or
-      # after BATCH_INTERVAL seconds, whichever comes first. The values below are deliberately
-      # larger than the 100/1.0 defaults baked into the Dockerfile: bigger batches are what keep the
-      # InfluxDB write rate reasonable once the message rate is high. Size them per deployment.
+      # Flush after BATCH_SIZE points or BATCH_INTERVAL seconds, whichever comes first; read once at
+      # import. Above the 100/1.0 defaults to keep the InfluxDB write rate down at a high load.
       BATCH_SIZE: 220
       BATCH_INTERVAL: 3
-      # Fleet convention, and cheap insurance rather than a fix for anything visible today: nothing
-      # this service prints is a formatted local time yet. Uvicorn's default format carries no
-      # timestamp at all, and every time the UI shows arrives as an epoch value that the BROWSER
-      # renders in its own zone. The day one `datetime.now()` reaches a log line, a container with no
-      # TZ writes it in UTC while the operator reading it is three hours ahead — and that gets
-      # discovered mid-incident, which is the worst moment to discover it.
+      # Fleet convention; nothing the service prints is a formatted local time.
       TZ: Europe/Moscow
-      # Set EXPLICITLY here even though the image already defaults to this exact path, and that is
-      # deliberate belt-and-braces rather than duplication. A stack carrying the label below is
-      # auto-updated: a new image can arrive and recreate the container with nobody editing this
-      # file, so the mount point it uses must not be something a future image is free to change
-      # underneath it. Written here, the pair of lines is self-consistent whatever the image
-      # defaults to. Read once at import — a change needs a restart, not a reload.
+      # Explicit although it is the image's default: an auto-updated stack must not depend on what a
+      # future image defaults to. Read once at import.
       DATA_DIR: /app/data
     volumes:
-      # Must stay in step with DATA_DIR above; see the block above the `volumes:` key at the top of
-      # this file for why the two move together or not at all.
+      # Must stay in step with DATA_DIR above (see the top-level `volumes:` note).
       - data:/app/data
     logging:
-      # Without this a json-file log grows without bound until the host's disk is full — which on a
-      # service logging every flush is not a theoretical horizon. 5 x 10m caps it at 50 MB.
+      # Caps the json-file log at 5 x 10m = 50 MB; uncapped it grows until the disk is full.
       driver: "json-file"
       options:
         max-file: 5
         max-size: 10m
     labels:
-      # The image updater in our Portainer build watches THIS label — the key the fleet uses.
-      # The `com.centurylinklabs.watchtower.*` family is legacy and is being migrated away — do
-      # not add one back. Where
-      # that updater is running, it is what makes a push of :latest by
-      # .gitea/workflows/image-check-publish.yml roll out on its own — and therefore what makes the
-      # smoke gate in that workflow the last place a broken image can still be stopped.
+      # The label the fleet's Portainer image updater watches: a :latest pushed by
+      # image-check-publish.yml rolls out on its own, so its smoke gate is the last stop.
       io.portainer.update.enable: "true"
     healthcheck:
-      # There is NO curl in the image (python:3.11-slim ships without it, and nothing installs it),
-      # so the probe is the interpreter that is already there. /api/stats is the right target: it
-      # answers 200 with `[]` when no stream is running at all, which is the state right after a
-      # deploy onto a fresh volume — a probe against a stream-dependent endpoint would report
-      # unhealthy on a perfectly good container. `python -c` gets an explicit exit code rather than
-      # relying on urlopen raising, and a non-2xx status raises HTTPError, which exits non-zero.
+      # No curl in the image, so python probes. /api/stats answers 200 with `[]` even with no stream
+      # running, as on a fresh volume.
       test:
         - CMD
         - python
@@ -185,14 +109,8 @@ services:
           import urllib.request, sys
           with urllib.request.urlopen("http://127.0.0.1:8000/api/stats", timeout=3) as response:
               sys.exit(0 if response.status == 200 else 1)
-      # THE TIMINGS ARE LOAD-BEARING. Do not raise them "because the service is stable".
-      # Docker schedules the FIRST probe one whole `interval` after `start_period` elapses, so a
-      # container with a long interval sits in `starting` and never once reports `healthy` inside
-      # the window an updater is watching. Portainer's image updater waits 120 s for `healthy` after
-      # recreating a container and ROLLS THE IMAGE BACK if it does not see it — so a long interval
-      # here does not merely delay a status, it makes every automatic update silently revert while
-      # the image itself looks fine. At 30s/10s this container reports healthy within ~15 s and the
-      # update sticks.
+      # Portainer's image updater rolls the image back unless the recreated container turns healthy
+      # within 120 s; a long interval makes every update revert.
       interval: 30s
       timeout: 5s
       retries: 3

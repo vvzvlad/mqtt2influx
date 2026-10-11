@@ -1,13 +1,9 @@
 #!/usr/bin/env python3
 """Durability of `save_streams()`.
 
-`{DATA_DIR}/streams.json` is the only copy of everything this service is configured with — every
-MQTT and InfluxDB credential included. There is no database behind it and no environment fallback,
-and `load_streams()` reports a damaged file as an empty one, so a save that fails halfway does not
-degrade the config, it deletes it and hides the fact.
-
-These tests are about the WRITE only. That `load_streams()` swallows errors is deliberate and
-documented in AGENTS.md, and tests/test_config.py pins it.
+streams.json is the only copy of the configuration, credentials included, and `load_streams()`
+reads a damaged file as empty, so a save that fails halfway deletes the config. These tests cover
+the write; tests/test_config.py covers the read.
 """
 
 import errno
@@ -43,9 +39,8 @@ def test_a_failure_partway_through_serialization_leaves_the_previous_file_intact
     save_streams([StreamConfig(id="a", name="one")])
     before = (data_dir / "streams.json").read_text()
 
-    # A field whose value json cannot encode. asdict() copies it happily, so the write is already
-    # under way when json.dump gives up — which is exactly the case `open(path, "w")` could not
-    # survive: it truncated the real file before the first byte was produced.
+    # A value json cannot encode: asdict() copies it, so json.dump fails with the write under way,
+    # which an in-place `open(path, "w")` would not survive.
     broken = StreamConfig(id="b", name="two")
     broken.mqtt_port = object()
 
@@ -58,15 +53,9 @@ def test_a_failure_partway_through_serialization_leaves_the_previous_file_intact
 
 
 def test_the_directory_is_synced_after_the_rename(data_dir, monkeypatch):
-    """`os.fsync(f.fileno())` makes the CONTENTS durable; the rename is a change to the DIRECTORY.
+    """The directory is fsynced after the rename, which makes the rename survive a power cut.
 
-    Until the directory's own entry is flushed, a host losing power in that window can come back
-    with the old streams.json, or with neither name pointing at the new data — and this file is the
-    only copy of every stream's MQTT and InfluxDB credentials, with no backup behind it. Against a
-    SIGKILL of the container it makes no difference (the page cache outlives the process); against
-    the machine going down it is the whole difference.
-
-    Order is asserted, not just occurrence: a directory synced BEFORE the rename records the state
+    Order is asserted, not just occurrence: a directory synced before the rename records the state
     the rename was about to change.
     """
     events = []
@@ -101,12 +90,9 @@ def test_the_directory_is_synced_after_the_rename(data_dir, monkeypatch):
 
 
 def test_a_directory_that_refuses_to_sync_does_not_fail_a_save_that_already_happened(data_dir, monkeypatch):
-    """The rename has already succeeded by then, so the new config IS the file on disk.
+    """By then the rename has succeeded and the save is done.
 
-    Turning "the directory entry could not be flushed" into an exception would answer a completed
-    save with a 500 and invite the operator to save again over a file that is already correct.
-    Filesystems and platforms that will not open or fsync a directory exist; a config that is saved
-    but not yet guaranteed against a power cut beats a config the API claims it failed to write.
+    Some filesystems refuse to open or fsync a directory; raising would report the save as failed.
     """
     def refusing_open(path, flags, *args, **kwargs):
         raise OSError(errno.EINVAL, "this filesystem will not open a directory")

@@ -1,18 +1,9 @@
 #!/usr/bin/env python3
-"""Batching, retries and the interval timer.
+"""Tests for src/mqtt_processor.py: batching, retries, the flush timer, shutdown and the MQTT link.
 
 Nothing here opens a socket. `aiomqtt.Client` is replaced with a fake whose `messages` iterator the
-test drives by hand, and `InfluxWriter` with a recorder that answers from a scripted list — so a
-failed write is a scripted `False`, not a real broker or a real InfluxDB.
-
-The two things being pinned:
-
-* a batch survives a write that fails, up to a bounded number of attempts inside a bounded amount of
-  time — the bound matters as much as the retry, because a flush from the message loop runs while
-  nothing is being read from the broker, and MQTT drops what it cannot deliver to a subscriber that
-  is not reading;
-* a batch leaves on the interval with no new message to trigger it, which is what README and
-  docker-compose have always promised and what the in-loop time check could never deliver.
+test drives by hand, and `InfluxWriter` with a recorder that answers from a scripted list, so a
+failed write is a scripted `False`.
 """
 
 import asyncio
@@ -37,14 +28,12 @@ from src.stream_manager import manager
 class FakeWriter:
     """Stands in for InfluxWriter. Answers from `results`, then True for anything past the script.
 
-    Shaped like the real writer: `write_batch_detailed` is the primitive and `write_batch` is the
-    thin bool wrapper over it, so a test that patches one cannot get a processor that quietly took
-    the other path. An entry in `results` is either a bool — a failure of the kind that is worth
-    retrying, which is what every failure used to be — or an explicit `(stored, worth_retrying)`
-    pair for the tests that care which kind InfluxDB gave.
+    Shaped like the real writer, `write_batch` wrapping `write_batch_detailed`, so whichever one
+    the processor calls answers from the same script. An entry in `results` is a bool (False is a
+    failure worth retrying) or an explicit `(stored, worth_retrying)` pair.
 
-    `delay` is how long a write occupies the event loop. It is what lets a test cancel a processor
-    while a batch is in flight rather than between flushes.
+    `delay` is how long a write occupies the event loop, so a test can cancel a processor while a
+    batch is in flight.
     """
 
     def __init__(self, results=None, delay=0.0):
@@ -180,10 +169,8 @@ async def _stop(proc, task):
 def instant_retries(monkeypatch):
     """Keep the retry ladder three rungs long but take the waiting out of it.
 
-    Three, matching the real ladder, so that "four attempts in all" stays the number the tests
-    below spell out. They spell it out as a literal rather than reading `len(RETRY_DELAYS)` back:
-    that name is patched right here, so an assertion computed from it would agree with any ladder
-    at all — including the empty one, under which no retry happens and every test still passes.
+    The tests assert "four attempts" as a literal: RETRY_DELAYS is patched here, so a count read
+    back from it would agree with any ladder, the empty one included.
     """
     monkeypatch.setattr(mqtt_processor, "RETRY_DELAYS", (0.0, 0.0, 0.0))
 
@@ -192,16 +179,10 @@ def instant_retries(monkeypatch):
 def reimport():
     """Re-execute src.mqtt_processor with a chosen environment, and put it back afterwards.
 
-    Reload rather than a call to the readers, because what needs pinning here is the WIRING: a
-    module that assigned BATCH_SIZE from a literal would still pass a test of
-    `batch_size_from_env()`, and a production container silently running 100/1.0 instead of the
-    220/3.0 in docker-compose sends InfluxDB 2.2 times as many write requests with nothing on any
-    screen to say so.
-
-    Reload re-runs the module body in the module's EXISTING namespace, so every importer — the
-    `from .mqtt_processor import StreamProcessor` in stream_manager, the names imported at the top
-    of this file — keeps working against objects whose globals are the ones just rebound. The
-    teardown reload restores the ambient environment's values for the tests that follow.
+    A reload, not a call to the readers, because it checks the wiring: a module that assigned
+    BATCH_SIZE from a literal would still pass a test of `batch_size_from_env()`. The reload re-runs
+    the module body in its existing namespace, so every importer keeps working; the teardown reload
+    restores the ambient values.
     """
     def _apply(values):
         for name, value in values.items():
@@ -223,7 +204,7 @@ def reimport():
     importlib.reload(mqtt_processor)
 
 
-# --- bug 1: a failed write used to drop the batch on the first answer -----------------------------
+# --- a failed write is retried before the batch is dropped ----------------------------------------
 
 async def test_a_batch_that_fails_once_is_written_on_the_retry(instant_retries):
     proc = make_processor()
@@ -261,9 +242,7 @@ async def test_a_batch_is_dropped_and_counted_once_the_attempts_are_spent(instan
 
     await proc._flush(writer)
 
-    # Four: the first attempt and one per rung of the ladder. A literal, because `instant_retries`
-    # has replaced RETRY_DELAYS and an assertion derived from it would hold for any ladder length,
-    # the empty one included.
+    # Four: the first attempt and one per rung of the ladder (a literal, see instant_retries).
     assert len(writer.calls) == 4
     assert proc.errors == 1
     assert proc.retries == 0
@@ -303,13 +282,10 @@ async def test_the_stats_expose_the_retry_counter():
     assert proc.get_stats()["retries"] == 3
 
 
-# --- bug 2: the interval flush had no clock of its own -------------------------------------------
+# --- the interval flush has a clock of its own ----------------------------------------------------
 
 async def test_a_batch_leaves_on_the_interval_with_no_new_message(monkeypatch):
-    # The one that goes red on the original code. The time check lived inside `async for message in
-    # client.messages`, so it could only be evaluated when a message arrived — on a topic that went
-    # quiet the batch simply stayed in memory. Exactly one message is published here, and it is well
-    # under BATCH_SIZE, so only a clock can get it out.
+    # One message, well under BATCH_SIZE, and nothing after it: only the timer can send it.
     monkeypatch.setattr(mqtt_processor, "BATCH_INTERVAL", 0.05)
     monkeypatch.setattr(mqtt_processor, "BATCH_SIZE", 1000)
     queue = asyncio.Queue()
@@ -374,10 +350,9 @@ async def test_a_reconnect_does_not_leak_a_flush_timer(monkeypatch):
 
 
 async def test_stopping_the_stream_kills_the_timer_and_flushes_without_waiting_out_the_retries(monkeypatch):
-    # Shutdown order: the timer goes first, or a tick lands in the middle of the final flush and the
-    # two race for the same batch. And the final flush skips the ladder — a container being stopped
-    # has a SIGTERM grace period, and spending it asleep between retries turns a graceful stop into
-    # a kill.
+    # The timer goes first, or a tick lands in the middle of the final flush and races it for the
+    # batch. The final flush skips the ladder: sleeping between retries would spend the SIGTERM
+    # grace period.
     monkeypatch.setattr(mqtt_processor, "BATCH_INTERVAL", 60)
     monkeypatch.setattr(mqtt_processor, "BATCH_SIZE", 1000)
     queue = asyncio.Queue()
@@ -435,20 +410,11 @@ async def test_the_timer_and_the_message_loop_never_lose_or_duplicate_a_point(mo
 
 # --- the stream's own precision, from streams.json to the batched point ---------------------------
 #
-# tests/test_influx_writer.py pins what each precision DOES. These two pin the wiring: that the
-# number in streams.json is the number the rounding is given. Everything in between is a chain of
-# defaults that each keep working on their own if a link comes loose — StreamConfig defaults to
-# None, resolve_value_precision turns None into 2, flatten_payload defaults to 2 — so a processor
-# that dropped the config entirely would round to two decimals and look completely healthy.
+# tests/test_influx_writer.py pins what each precision does; these two pin the wiring. Every layer
+# in between defaults to two decimals, so a processor that dropped the config would still look
+# healthy.
 
 async def test_a_streams_configured_precision_reaches_the_points_it_batches(monkeypatch):
-    """The kiln stream, end to end: what it sets is what lands in the batch.
-
-    Deliberately checked through the batch and not through `to_number`, because every layer between
-    them defaults to the same two decimals. If `StreamProcessor` ignored `cfg.value_precision`
-    outright, every unit test of the rounding would still pass and this is the only thing that
-    would go red.
-    """
     monkeypatch.setattr(mqtt_processor, "BATCH_SIZE", 1)
     queue = asyncio.Queue()
     install_fake_client(monkeypatch, queue)
@@ -472,7 +438,6 @@ async def test_a_streams_configured_precision_reaches_the_points_it_batches(monk
 
 
 async def test_a_stream_that_configures_nothing_still_batches_two_decimals(monkeypatch):
-    """The same path with an untouched config — the shape every production stream is in today."""
     monkeypatch.setattr(mqtt_processor, "BATCH_SIZE", 1)
     queue = asyncio.Queue()
     install_fake_client(monkeypatch, queue)
@@ -497,13 +462,11 @@ async def test_a_stream_that_configures_nothing_still_batches_two_decimals(monke
 
 # --- the stream's write_strings flag, from streams.json to the batched point ----------------------
 #
-# The same wiring problem as the precision above, and a worse failure mode: every default along the
-# chain is "off", so a processor that never passed `cfg.write_strings` on to `flatten_payload` would
-# drop status strings exactly as it always has — a stream with the box ticked, saved, restarted and
-# reported healthy, writing nothing. Nothing in the unit tests of `flatten_payload` can see that.
+# The same wiring check as above: every default along the chain is off, so a processor that never
+# passed `cfg.write_strings` to `flatten_payload` would drop status strings and look healthy.
 
 async def test_a_stream_with_write_strings_on_batches_a_status_string(monkeypatch):
-    """The printer stream, end to end: "Printing" reaches the writer instead of being dropped."""
+    """End to end: "Printing" reaches the writer instead of being dropped."""
     monkeypatch.setattr(mqtt_processor, "BATCH_SIZE", 1)
     queue = asyncio.Queue()
     install_fake_client(monkeypatch, queue)
@@ -525,7 +488,6 @@ async def test_a_stream_with_write_strings_on_batches_a_status_string(monkeypatc
 
 
 async def test_a_stream_that_leaves_the_flag_off_still_drops_a_status_string(monkeypatch):
-    """The shape every production stream is in today — the message is received and writes nothing."""
     monkeypatch.setattr(mqtt_processor, "BATCH_SIZE", 1)
     queue = asyncio.Queue()
     install_fake_client(monkeypatch, queue)
@@ -549,11 +511,9 @@ async def test_a_stream_that_leaves_the_flag_off_still_drops_a_status_string(mon
     ]
 
 
-# --- bug 3: the dead auth placeholder ------------------------------------------------------------
+# --- MQTT credentials -----------------------------------------------------------------------------
 
 async def test_credentials_reach_the_client_and_nothing_else_pretends_to_carry_them(monkeypatch):
-    # There used to be an `auth` local assigned `aiomqtt.Will` under a comment promising it was "set
-    # below". Nothing set it and nothing read it; the credentials go where this asserts they go.
     monkeypatch.setattr(mqtt_processor, "BATCH_INTERVAL", 60)
     queue = asyncio.Queue()
     created = install_fake_client(monkeypatch, queue)
@@ -576,7 +536,7 @@ async def test_credentials_reach_the_client_and_nothing_else_pretends_to_carry_t
     assert created[0].subscribed == ["#"]
 
 
-# --- bug 6: is_alive, the half that lives on the processor ---------------------------------------
+# --- is_alive -------------------------------------------------------------------------------------
 
 async def test_a_processor_is_not_alive_before_it_is_started():
     # `_task` is None here, and `None.done()` is what a naive check would raise on.
@@ -616,12 +576,9 @@ async def test_a_processor_whose_task_died_is_not_alive(monkeypatch):
 
 # --- a cancellation landing in the middle of a write ----------------------------------------------
 #
-# The batch is taken out of `self._batch` atomically and only then written, which is what keeps two
-# concurrent flushes from sending the same points twice. The cost is a window — the whole duration
-# of the write, up to 10s of aiohttp timeout plus the ladder — in which the only reference to those
-# points is a local variable. A cancellation arriving inside that window is not a corner case: it
-# is every `docker stop`, and Portainer's updater recreates this container on every push of
-# `:latest`. Nothing about the loss was visible: no error counted, no event emitted, no log line.
+# The batch is taken out of `self._batch` before it is written, so two flushes never send the same
+# points. For the length of the write the only reference to them is a local, and a `docker stop`
+# can cancel inside that window.
 
 async def test_a_write_cancelled_in_flight_gives_its_points_back_to_the_batch():
     proc = make_processor()
@@ -662,11 +619,9 @@ async def test_points_handed_back_by_a_cancelled_write_go_in_front_of_the_newer_
 
 
 async def test_a_shutdown_during_a_size_flush_still_accounts_for_every_published_point(monkeypatch):
-    # Path one: the flush in flight belongs to the message loop, fired because the batch filled.
-    # The cancellation lands inside it, unwinds the message loop, and `_connect_and_process`'s
-    # finally runs the final flush — which, before this, looked at a `self._batch` the cancelled
-    # write had already emptied, found nothing, and returned. Every point published here has to end up either written or still in
-    # the batch; anything else is a point that existed and then did not.
+    # The flush in flight is the message loop's, fired because the batch filled. The cancellation
+    # unwinds the loop and the final flush runs in `_connect_and_process`'s finally. Every point
+    # published has to end up either written or still in the batch.
     monkeypatch.setattr(mqtt_processor, "BATCH_INTERVAL", 60)
     monkeypatch.setattr(mqtt_processor, "BATCH_SIZE", 2)
     queue = asyncio.Queue()
@@ -690,11 +645,9 @@ async def test_a_shutdown_during_a_size_flush_still_accounts_for_every_published
 
 
 async def test_a_shutdown_while_the_timer_is_writing_does_not_lose_the_timers_batch(monkeypatch):
-    # Path two, and the wider of the two: at BATCH_INTERVAL=3 against a slow InfluxDB the timer is
-    # inside a write most of the time, so this is the likelier of the two to be true at the moment
-    # SIGTERM arrives. It needs both halves of the fix — the timer has to hand its points back, AND
-    # the shutdown has to await the cancelled timer before flushing, because cancel() only
-    # schedules the cancellation and the hand-back happens on a later pass of the event loop.
+    # The flush in flight is the timer's. The shutdown has to await the cancelled timer before the
+    # final flush: cancel() only schedules the cancellation, and the timer hands its points back on
+    # a later pass of the event loop.
     monkeypatch.setattr(mqtt_processor, "BATCH_INTERVAL", 0.05)
     monkeypatch.setattr(mqtt_processor, "BATCH_SIZE", 1000)  # nothing here flushes on size
     queue = asyncio.Queue()
@@ -717,22 +670,10 @@ async def test_a_shutdown_while_the_timer_is_writing_does_not_lose_the_timers_ba
 
 
 async def test_a_cancellation_inside_the_retry_ladder_still_gives_the_points_back(monkeypatch):
-    # The third of the cancellation paths and the one none of the others reach: both tests above
-    # flush with `retry=False`, so `async with asyncio.timeout(RETRY_BUDGET)` in _write_with_retries
-    # is never entered at all. In production it is entered on every flush the message loop and the
-    # timer make — and it is the widest window of the three, because a stream that is retrying is a
-    # stream whose InfluxDB is already unwell, which is exactly when a deploy tends to be happening.
-    #
-    # It is also the window with a second way to lose the batch. The budget's expiry arrives at the
-    # same await, as a CancelledError raised by asyncio.timeout, and THAT one is meant to be caught
-    # and turned into a dropped batch (test_the_retry_ladder_is_capped_in_wall_clock_time requires
-    # it). Widening `except TimeoutError` to take the cancellation with it — the obvious tidy-up —
-    # would make a shutdown mid-ladder look like an exhausted budget: the points are gone, an error
-    # is counted, and the final flush finds an empty batch.
-    #
-    # RETRY_BUDGET is raised rather than left alone so that the two cannot be confused here: nothing
-    # in this test can reach the budget, so the only thing that can empty the batch is the
-    # cancellation.
+    # The tests above flush with `retry=False` and never enter `asyncio.timeout(RETRY_BUDGET)`.
+    # Inside it, an expired budget and a shutdown both arrive as a cancellation at the same await:
+    # the first becomes a dropped batch, the second must give the points back. RETRY_BUDGET is
+    # raised so that nothing here can reach it.
     monkeypatch.setattr(mqtt_processor, "RETRY_DELAYS", (0.0, 0.0, 0.0))
     monkeypatch.setattr(mqtt_processor, "RETRY_BUDGET", 30.0)
 
@@ -776,17 +717,9 @@ async def test_a_cancellation_inside_the_retry_ladder_still_gives_the_points_bac
 # --- leaving the message loop is what flushes, whichever way it was left ---------------------------
 
 async def test_a_stream_that_leaves_the_message_loop_on_its_own_still_flushes_what_it_batched(monkeypatch):
-    """`if not self._running: break` is a normal return, not a cancellation.
+    """`if not self._running: break` is a normal return, not a cancellation, and still flushes.
 
-    It leaves the `async for`, `while self._running` is then false, and `_process_forever` returns —
-    so while the final flush lived in a handler for `asyncio.CancelledError` this path walked past
-    it with up to BATCH_SIZE points still in `self._batch`, and the timer's `finally` then handed
-    the timer's own rescued points into the same batch with nothing left running to send them.
-
-    Nothing reaches it through `stop()` today: it sets `_running` and cancels in the same run of
-    statements with no await between them, so the task never observes the gap. The `break` is
-    written for a soft stop all the same — a paused stream, a drain before a reload — and this test
-    is what keeps that from being a silent loss of one batch per stream the day one is added.
+    stop() never takes it: it clears the flag and cancels with no await in between.
     """
     monkeypatch.setattr(mqtt_processor, "BATCH_INTERVAL", 60)   # no interval flush
     monkeypatch.setattr(mqtt_processor, "BATCH_SIZE", 1000)     # no size flush
@@ -818,8 +751,7 @@ async def test_a_disconnect_that_times_out_during_a_shutdown_still_flushes_what_
 
     Its disconnect wait is bounded by the client's `timeout=`, and the expiry raises
     `MqttError("Operation timed out")` in place of the `CancelledError`. The loop's `except Exception`
-    absorbs that, `while self._running` is already false, and `_process_forever` returns NORMALLY —
-    past a final flush that used to live in a handler for the cancellation.
+    absorbs that, `while self._running` is already false, and `_process_forever` returns normally.
     """
     monkeypatch.setattr(mqtt_processor, "BATCH_INTERVAL", 60)   # no interval flush
     monkeypatch.setattr(mqtt_processor, "BATCH_SIZE", 1000)     # no size flush
@@ -855,11 +787,9 @@ async def test_a_disconnect_that_times_out_during_a_shutdown_still_flushes_what_
 
 
 async def test_a_shutdown_during_the_reconnect_backoff_still_flushes_what_it_batched(monkeypatch):
-    """A cancellation landing in the backoff sleep is raised INSIDE the `except Exception` body.
+    """A cancellation landing in the backoff sleep is raised inside the `except Exception` body.
 
-    A sibling `except asyncio.CancelledError` of the same `try` would not catch what another of its
-    handlers raises, so while the final flush lived in one, a stream stopped while it waited to
-    reconnect left with the points it had batched before the link dropped.
+    No sibling handler of the same `try` catches that, which is why the final flush is a `finally`.
     """
     monkeypatch.setattr(mqtt_processor, "BATCH_INTERVAL", 60)   # no interval flush
     monkeypatch.setattr(mqtt_processor, "BATCH_SIZE", 1000)     # no size flush
@@ -895,8 +825,7 @@ async def test_a_shutdown_during_the_reconnect_backoff_still_flushes_what_it_bat
 
 async def test_a_flush_timer_that_died_does_not_take_the_final_flush_with_it(monkeypatch, caplog):
     """The timer is awaited before the final flush, and it can end in something other than a
-    cancellation. Swallowing only `CancelledError` there let any other exception out of the
-    `finally` ahead of the flush, and the whole batch went with it."""
+    cancellation; that exception is logged and the flush still runs."""
     monkeypatch.setattr(mqtt_processor, "BATCH_SIZE", 1000)     # no size flush
     queue = asyncio.Queue()
     install_fake_client(monkeypatch, queue)
@@ -928,10 +857,8 @@ async def test_a_flush_timer_that_died_does_not_take_the_final_flush_with_it(mon
 # --- a failure InfluxDB will give again is not worth asking about again ---------------------------
 
 async def test_an_answer_that_will_not_change_is_not_retried(instant_retries):
-    # 400 on a body the line parser refuses, 401 on a rotated password, 404 on a dropped database.
-    # The ladder against those is pure cost: up to 10s of aiohttp timeout plus the whole
-    # RETRY_BUDGET per batch, spent by a message loop that is not draining the broker's queue,
-    # against an answer that is guaranteed to be identical.
+    # 400 on a body the line parser refuses, 401 on a rotated password, 404 on a dropped database:
+    # the answer will not change, and the ladder would only stall the message loop.
     proc = make_processor()
     writer = FakeWriter([(False, False)])
     proc._batch = [("dev/temp", 21.5, 1000)]
@@ -962,11 +889,8 @@ async def test_the_ladder_stops_the_moment_the_answer_turns_permanent(instant_re
 # --- the dashboard shows the newest answer, not the last one to arrive ----------------------------
 
 async def test_a_slow_flush_finishing_late_does_not_overwrite_a_newer_flushs_result():
-    # Two flushes overlap by design — the lock is released before the write — and they can finish
-    # in the opposite order to the one they started in. Whoever finished last used to win, so a
-    # slow failing flush landing after a fast successful one left `last_flush_ok` false and
-    # `last_flush_count` describing a batch that had already been superseded. The data is fine;
-    # what is wrong is the only indicator an operator has that the bridge is healthy.
+    # Two flushes overlap by design (the lock is released before the write) and can finish in the
+    # opposite order to the one they started in. The dashboard shows the one that started later.
     proc = make_processor()
     slow = FakeWriter([False], delay=0.2)
     fast = FakeWriter([True])
@@ -992,11 +916,9 @@ async def test_a_slow_flush_finishing_late_does_not_overwrite_a_newer_flushs_res
 # --- the interval is measured from the last flush, not from the timer's last wakeup ---------------
 
 async def test_a_size_driven_flush_pushes_the_next_tick_a_whole_interval_out(monkeypatch):
-    # The original code compared `now - last_flush` and reset `last_flush` on ANY flush, so the
-    # interval always meant "this long since something was last written". A timer that sleeps
-    # BATCH_INTERVAL unconditionally means "this long since I last woke up", and under load a tick
-    # then lands milliseconds after a full batch went out and posts the one or two points that
-    # arrived in between — an extra small write per stream per interval, forever.
+    # The interval means "this long since something was last written". Measured from the timer's
+    # own wakeup instead, a tick would land just after a full batch went out and post the one or
+    # two points that arrived in between.
     monkeypatch.setattr(mqtt_processor, "BATCH_INTERVAL", 1.0)
     proc = make_processor()
     writer = FakeWriter()
@@ -1021,13 +943,11 @@ async def test_a_size_driven_flush_pushes_the_next_tick_a_whole_interval_out(mon
 
 # --- the constants themselves ---------------------------------------------------------------------
 #
-# Every one of these was checked by mutation: emptying the ladder, raising the budget to an hour and
-# unhooking either batching constant from the environment each left the whole suite green, because
-# the only tests that touched them patched them first.
+# Every other test patches these first, so only the tests below see the real values.
 
 def test_the_retry_ladder_has_rungs_and_all_of_them_wait():
-    # An empty tuple makes `_write_with_retries` a single attempt with a retry counter that can
-    # never move: retries disappear in silence and every InfluxDB blip costs a batch again.
+    # An empty tuple makes `_write_with_retries` a single attempt: every InfluxDB blip costs a batch
+    # and the retry counter never moves.
     assert len(mqtt_processor.RETRY_DELAYS) > 0
     assert all(delay > 0 for delay in mqtt_processor.RETRY_DELAYS)
 
@@ -1040,10 +960,9 @@ def test_every_rung_of_the_ladder_is_reachable_inside_the_budget():
 
 
 def test_the_retry_budget_stays_within_one_attempts_own_timeout():
-    # The budget is added on top of the first attempt's 10s aiohttp timeout, and for its whole
-    # length this stream takes nothing out of aiomqtt's incoming queue. Keeping it at or under one
-    # attempt's timeout keeps the worst case of a flush at roughly 2x a single write, instead of the
-    # 43s blind window the unbounded ladder produced.
+    # The budget comes on top of the first attempt's 10s aiohttp timeout, while this stream takes
+    # nothing out of aiomqtt's incoming queue. At or under one attempt's timeout, the worst-case
+    # flush stays at roughly twice a single write.
     assert 0 < mqtt_processor.RETRY_BUDGET <= 10.0
 
 
@@ -1068,9 +987,7 @@ def test_the_batch_interval_is_read_from_the_environment(monkeypatch):
 
 
 def test_the_module_constants_are_the_environments_values_and_not_literals(reimport):
-    # docker-compose sets 220 and 3.0; the defaults are 100 and 1.0. A build that stopped reading
-    # either would run at more than twice the write rate against InfluxDB and look identical from
-    # every screen the service has.
+    # Values other than the defaults (100 and 1.0), so a module that ignored the environment fails.
     reloaded = reimport(BATCH_SIZE="220", BATCH_INTERVAL="3.0")
 
     assert reloaded.BATCH_SIZE == 220
@@ -1087,12 +1004,9 @@ def test_the_module_constants_fall_back_to_the_documented_defaults(reimport):
 # --- the incoming queue, and what a stalled consumer really costs ---------------------------------
 
 async def test_the_client_is_built_with_a_bounded_incoming_queue(monkeypatch):
-    # A flush retrying inside `async for message in client.messages` does not stop the socket being
-    # read: aiomqtt's reader callback lives on the event loop, and `_on_message` keeps filling the
-    # client's queue while this coroutine hangs on an await. Unbounded, a long InfluxDB outage is
-    # therefore not silence but linear memory growth, and the container has no memory limit — the
-    # OOM kill at the end of it drops the MQTT subscription, which is the loss that cannot be
-    # undone. Bounded, the same outage discards the newest arrivals with a line in aiomqtt's log.
+    # A flush retrying inside `async for message` does not stop aiomqtt reading the socket: its
+    # callback keeps filling the client's queue. Unbounded, a long InfluxDB outage grows memory
+    # until an OOM kill; bounded, it discards the newest arrivals with a line in aiomqtt's log.
     monkeypatch.setattr(mqtt_processor, "BATCH_INTERVAL", 60)
     queue = asyncio.Queue()
     created = install_fake_client(monkeypatch, queue)
@@ -1109,11 +1023,9 @@ async def test_the_client_is_built_with_a_bounded_incoming_queue(monkeypatch):
 
 
 async def test_the_bound_reaches_the_queue_aiomqtt_actually_builds():
-    # The keyword above is only worth anything if aiomqtt has it. `aiomqtt.Client(...)` opens no
-    # socket — the queue is built in __init__, which is also why this test has to be async: the
-    # constructor asks for the running loop. It is the only thing standing between a renamed or
-    # misspelled parameter and a production client running on the unbounded default while a test
-    # suite full of fakes that swallow **kwargs stays green.
+    # The fakes swallow **kwargs, so only the real client shows that aiomqtt takes the keyword.
+    # `aiomqtt.Client(...)` opens no socket and builds the queue in __init__; the test is async
+    # because the constructor asks for the running loop.
     client = aiomqtt.Client(
         hostname="broker.invalid",
         max_queued_incoming_messages=mqtt_processor.MAX_QUEUED_INCOMING_MESSAGES,
@@ -1124,9 +1036,8 @@ async def test_the_bound_reaches_the_queue_aiomqtt_actually_builds():
 
 # --- the MQTT link, as opposed to the task --------------------------------------------------------
 #
-# On 2026-08-27 a stream spent 15 minutes failing to connect to a healthy broker, once every 15
-# seconds, while GET /api/streams reported `running: true` — the task was alive the whole time and
-# nothing anywhere described the link. The `except` that ran sixty times that afternoon had no test.
+# The reconnect loop keeps the task alive through every failed connect, so a running task says
+# nothing about the link; `connected` and the failure counters describe it.
 
 def install_refusing_client(monkeypatch, on_construct):
     """Replace aiomqtt.Client with one whose connect always fails, the way aiomqtt reports it."""
@@ -1279,7 +1190,7 @@ async def test_a_stream_whose_link_is_down_is_running_but_not_connected_in_stats
 
 async def test_a_connect_that_hangs_in_the_executor_is_bounded_and_retried(monkeypatch):
     # aiomqtt's __aenter__ runs paho's blocking connect() in an executor thread before its own
-    # timeout starts, so a hung DNS lookup or kernel connect used to block the stream for good.
+    # timeout starts; unbounded, a hung DNS lookup or kernel connect would block the stream forever.
     monkeypatch.setattr(mqtt_processor, "MQTT_TIMEOUT", 0.05)
     monkeypatch.setattr(mqtt_processor, "RECONNECT_DELAY", 0)
     monkeypatch.setattr(mqtt_processor, "BATCH_INTERVAL", 60)
