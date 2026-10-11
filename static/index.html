@@ -330,10 +330,7 @@ function appendLogEntryDOM(body, entry) {
   div.className = 'log-entry';
   const ts = new Date(entry.ts);
   const hms = ts.toTimeString().slice(0,8) + '.' + String(ts.getMilliseconds()).padStart(3,'0');
-  // The value goes through escHtml() exactly like the topic beside it. It used to be interpolated
-  // raw, which read the same for as long as every value was a number; with write_strings the value
-  // is whatever was published to the broker, and a status spelled `<idle>` would be parsed as a tag
-  // and vanish from the log — the new setting looking broken on the one screen that shows it works.
+  // The value is escaped like the topic: with write_strings it is whatever was published to the broker.
   div.innerHTML = `<span class="log-ts">${hms}</span><span class="log-topic" title="${escHtml(entry.topic)}">${escHtml(entry.topic)}</span><span class="log-value">${escHtml(entry.value)}</span>`;
   body.appendChild(div);
   while (body.children.length > DOM_MAX_LOG) body.removeChild(body.firstChild);
@@ -474,13 +471,9 @@ function openModal(prefill) {
   document.getElementById('fInfluxUser').value = f.influx_user || '';
   document.getElementById('fInfluxPass').value = f.influx_password || '';
   document.getElementById('fInfluxDb').value = f.influx_database || '';
-  // ?? and not ||, because 0 is a legitimate precision (round to whole numbers) and || would
-  // blank the box for it, so saving an untouched form would silently reset the stream to 2.
+  // ?? and not ||: 0 is a valid precision, and || would blank the box and save the default instead.
   document.getElementById('fValuePrecision').value = f.value_precision ?? '';
-  // !! only turns the missing key of an older record into an explicit false; `.checked = undefined`
-  // would work by accident. It is NOT a guard against a hand-edited string in streams.json — a
-  // ticked box is the honest reading of one, because the processor resolves the same field with
-  // bool(), and bool("false") is True there too. Through the API such a value never gets in: 422.
+  // !! turns a missing key into false; a hand-edited truthy string shows ticked, as bool() reads it.
   document.getElementById('fWriteStrings').checked = !!f.write_strings;
   document.getElementById('overlay').classList.add('open');
 }
@@ -494,35 +487,14 @@ async function saveStream() {
   const mqttHost = document.getElementById('fMqttHost').value.trim();
   const influxHost = document.getElementById('fInfluxHost').value.trim();
   const influxDb = document.getElementById('fInfluxDb').value.trim();
-  // An empty box means "not configured" and must travel as null, not as 0, so that a cleared field
-  // keeps meaning "the default two decimals". `Number('')` is 0 and NOT NaN, so this branch is the
-  // only thing between an untouched box and a request that asks for whole numbers — which the API
-  // stores without a word of complaint. That is too much to hang on one expression, so the same raw
-  // string is tested again in the request body below: two independent checks, both landing on null,
-  // so losing either one costs the default two decimals rather than the fractional part of every
-  // value in the stream.
-  // Number() and not parseInt(), and the pair with the whole-number check below is the whole
-  // point: `step="1"` and `min` are hints the browser applies to its own spinners and to
-  // checkValidity(), which this function does not call, so `0.5` and `1e-5` can be TYPED into the
-  // box and read straight back out of .value. parseInt() answers those two with 0 and with 1 —
-  // rounding to whole numbers, and to one decimal, on a stream whose operator asked for neither and
-  // saw the form save without a word. Number() keeps the value the operator actually entered, and
-  // the guard refuses it when it is not a whole number.
+  // An empty box is sent as null (the default two decimals), because `Number('')` is 0.
+  // Number() and not parseInt(): a typed 0.5 reaches the API and gets a 422 instead of becoming 0.
   const precisionRaw = document.getElementById('fValuePrecision').value.trim();
   const valuePrecision = precisionRaw === '' ? null : Number(precisionRaw);
 
   if (!mqttHost) { alert('MQTT Host is required'); document.getElementById('fMqttHost').focus(); return; }
   if (!influxHost) { alert('InfluxDB Host is required'); document.getElementById('fInfluxHost').focus(); return; }
   if (!influxDb) { alert('InfluxDB Database is required'); document.getElementById('fInfluxDb').focus(); return; }
-  // isSafeInteger and not isInteger: `Number.isInteger(1e21)` is true, but JSON.stringify writes
-  // that number as `1e+21` and Python's json.loads reads `1e+21` back as a FLOAT, so the API
-  // answers 422 for a value this guard has just called whole. Above 2^53 the two sides of the
-  // request do not mean the same thing by "integer"; below it they do.
-  if (valuePrecision !== null && !Number.isSafeInteger(valuePrecision)) {
-    alert('Value Precision must be a whole number — leave it empty for the default 2, or -1 to store values as received');
-    document.getElementById('fValuePrecision').focus();
-    return;
-  }
 
   const body = {
     name: document.getElementById('fName').value.trim(),
@@ -537,14 +509,8 @@ async function saveStream() {
     influx_user: document.getElementById('fInfluxUser').value.trim(),
     influx_password: document.getElementById('fInfluxPass').value,
     influx_database: influxDb,
-    // The second of the two empty-box checks (see the read above), and the reason it tests
-    // `precisionRaw` rather than the number: `Number('')` is 0, so nothing downstream of the parse
-    // can tell an empty box from an operator who typed a zero. If the ternary up there is ever lost
-    // or rewritten, this is what still sends null instead of quietly rounding the whole stream to
-    // whole numbers. isFinite is the cheap catch-all for NaN and the infinities.
-    value_precision: precisionRaw === '' || !Number.isFinite(valuePrecision) ? null : valuePrecision,
-    // `.checked` is already a real boolean, which is what the API insists on: it answers anything
-    // else with 422 rather than reading a truthy string as a yes.
+    value_precision: valuePrecision,
+    // `.checked` is a real boolean, which the API requires: anything else is a 422.
     write_strings: document.getElementById('fWriteStrings').checked,
     enabled: true,
   };
@@ -553,21 +519,16 @@ async function saveStream() {
   const url = editingId ? `/api/streams/${editingId}` : '/api/streams';
   const res = await fetch(url, { method, headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
   if (!res.ok) {
-    // The modal stays OPEN and nothing is reloaded. A refusal used to close the form and redraw the
-    // list exactly like a save that worked, which threw away every other edit made in the same
-    // window — a changed mqtt_host, say — with nothing on screen to say the stream was never
-    // written. 422 (a precision the API reads as a float), 404 (the stream was deleted in another
-    // tab) and 500 all came through that path.
+    // The modal stays open and nothing is reloaded, so a refused save keeps the operator's edits.
     let detail = '';
     try {
       const payload = await res.json();
-      // FastAPI puts the message in `detail`: a string for HTTPException, a list of field errors
-      // when the request model itself rejected the body.
+      // FastAPI's `detail` is a string for HTTPException and a list for request validation errors.
       if (payload && payload.detail !== undefined) {
         detail = typeof payload.detail === 'string' ? payload.detail : JSON.stringify(payload.detail);
       }
     } catch (e) {
-      // A body that is not JSON — a proxy's error page — leaves the status to speak on its own.
+      // A body that is not JSON (a proxy's error page): the status is reported on its own.
     }
     alert(`Could not save the stream: HTTP ${res.status}${detail ? ` — ${detail}` : ''}`);
     return;
