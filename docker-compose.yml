@@ -1,32 +1,13 @@
-# EXAMPLE compose — an illustration of how this service is configured, NOT a copy of what runs.
+# EXAMPLE compose: which variables, volumes, ports and labels the service needs. It is not kept
+# in sync with the running deployment (a Portainer stack, which is the source of truth); do not
+# reconcile the two in either direction.
 #
-# What it is for: showing which variables the service reads, which volumes and ports it needs,
-# and which labels matter. Copy it as a starting point for a deployment. That is the whole job.
+# Every value is a placeholder (`XXX` for a secret, `example.com`/`example.lc` for a name, an
+# RFC 5737 address for an IP), comments included; the only real value is the registry host.
+# Several of these repositories are public.
 #
-# It is NOT kept in sync with the running deployment and MUST NOT BE. Wherever this service
-# actually runs — in this fleet, a Portainer stack — THAT deployment is the only source of truth
-# for what it does: its variables, its volume paths, its domain, its image tag. This file cannot
-# answer any of those questions, and it is not trying to. A difference between the two is
-# therefore NOT a defect and NOT something to reconcile: there is nothing here to bring into
-# agreement. Do not "fix" this file against a running deployment, and do not change a deployment
-# to match this file.
-#
-# NOTHING REAL GOES IN HERE. Not a password, not a token, not a key, not a host. Every value below
-# is a PLACEHOLDER: `XXX` for a secret, `example.com` or `example.lc` for a name, a documentation
-# address (RFC 5737 — 192.0.2.0/24, 198.51.100.0/24, 203.0.113.0/24) for an IP. That holds INSIDE
-# COMMENTS TOO, and it holds for a value that is only a default rather than a credential. Never
-# write a real one here, and never "correct" a placeholder to the value some deployment happens to
-# use. Naming a real host is precisely what makes the next reader believe this file describes
-# production — the mistake this header exists to prevent, and one that keeps being made. Several
-# of these repositories are public and mirrored: a secret committed here is a secret published.
-#
-# ONE deliberate exception: the registry host, wherever it appears — in the image path or in a
-# comment. It is real, because without it there is nothing to pull.
-#
-# Deploy from a prebuilt image — a `build:` here, where present, is for running locally.
-#
-# NAMING: the repository, the service, the container, the Portainer stack and the image are all
-# named mqtt2influx; the volume note below depends on it.
+# Deploy from the prebuilt image. The repository, service, container, Portainer stack and image are
+# all named mqtt2influx; the volume note below depends on it.
 #
 # A bridge from MQTT into InfluxDB, with a web UI to configure and watch the streams. MQTT does not
 # buffer for a subscriber that is not connected, so downtime here is data loss, not lag.
