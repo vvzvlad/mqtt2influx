@@ -10,10 +10,8 @@ from typing import List, Optional
 
 from .settings import settings
 
-# Read ONCE, at import, into a module-level name that `_config_path()` looks up on every call — so
-# rebinding this name redirects every read and write below, which is exactly what tests/conftest.py
-# does to keep the suite off the real directory. Keep it a module-level rebindable name rather than
-# reaching for `settings.data_dir` inline.
+# Read once, at import. `_config_path()` looks this name up on every call, so tests/conftest.py
+# rebinds it to keep the suite off the real directory; do not inline `settings.data_dir`.
 DATA_DIR = settings.data_dir
 
 
@@ -33,16 +31,12 @@ class StreamConfig:
     influx_password: str = ""
     influx_database: str = ""
     enabled: bool = True
-    # Decimals every numeric value from this stream is rounded to before it is written.
-    # None — and an absent key, which is the same thing — means "not configured" and gets the two
-    # decimals this service has always applied. A negative number means "store it as it arrived".
-    # See DEFAULT_VALUE_PRECISION / RAW_VALUE_PRECISION in influx_writer.py for why the states are
-    # spelled this way, and _serialize() below for why an unset one never reaches the file.
+    # Decimals numeric values are rounded to before they are written. None (or an absent key) means
+    # DEFAULT_VALUE_PRECISION; a negative number stores values as they arrived (RAW_VALUE_PRECISION,
+    # influx_writer.py). See _serialize() for why an unset value never reaches the file.
     value_precision: Optional[int] = None
-    # Write non-numeric payloads from this stream as InfluxDB STRING fields instead of dropping
-    # them. Off by default, because the drop is what every existing stream and every existing series
-    # was built on: a topic that has only ever carried numbers must not suddenly start emitting
-    # string fields. See _serialize() below for why a stream that leaves it off writes no such key.
+    # Write non-numeric payloads as InfluxDB string fields instead of dropping them. Off by default:
+    # existing series were built on numbers only. See _serialize() for why "off" writes no key.
     write_strings: bool = False
 
 
@@ -64,12 +58,8 @@ def load_streams() -> List[StreamConfig]:
 
 
 def _fsync_directory(directory: str):
-    # Failures are swallowed on purpose, and only here. By the time this runs os.replace() has
-    # already succeeded, so the new config IS the file on disk: turning "the directory entry could
-    # not be flushed" into an exception would answer a completed save with a 500 and invite the
-    # operator to save again. Filesystems and platforms that refuse to open or fsync a directory
-    # exist; a config that is saved but not yet guaranteed against a power cut is strictly better
-    # than a config the API claims it failed to save.
+    # Failures are swallowed: os.replace() has already succeeded, so the save is done, and some
+    # filesystems refuse to open or fsync a directory. Raising would answer a done save with a 500.
     try:
         fd = os.open(directory or ".", os.O_RDONLY)
     except OSError:
@@ -85,25 +75,16 @@ def _fsync_directory(directory: str):
 def _serialize(stream: StreamConfig) -> dict:
     """asdict(), minus the optional keys this stream never set.
 
-    Adding a field to StreamConfig is not a free act, because `load_streams()` builds its objects
-    with `StreamConfig(**record)` and an undeclared keyword is a TypeError — which the bare `except`
-    below turns into an empty list, i.e. EVERY STREAM GONE, and the next save writes that emptiness
-    back over the file. The version of the code that will choke is not this one, it is whatever
-    older image someone rolls back to after this one has already rewritten streams.json.
-
-    Writing `value_precision` only when it is actually set is what keeps that door shut for the
-    streams that do not use the feature: their record stays byte-for-byte the record an older image
-    already knows how to read, so a rollback is as safe as it was before this field existed. A
-    stream that DOES opt in carries the key and an older image would refuse the whole file — that
-    one is unavoidable, is the price of the setting, and is written down in README.
+    `load_streams()` builds `StreamConfig(**record)` and turns the TypeError of an undeclared key
+    into an empty list, which the next save writes over the file. Leaving unset optional keys out
+    keeps a record readable by an older image after a rollback; a stream that sets one is not
+    (see README).
     """
     record = asdict(stream)
     if record.get("value_precision") is None:
         del record["value_precision"]
-    # Same rule, same reason, for `write_strings`: a stream that never turned it on keeps a record an
-    # older image can still read. Falsy rather than `is False` on purpose — a hand-edited file
-    # carrying `null` or `0` there means "off" just as much as `false` does, and writing it back out
-    # would poison the file for an older build over a setting nobody actually asked for.
+    # Falsy rather than `is False`: a hand-edited `null` or `0` means off too, and writing it back
+    # would make the file unreadable for an older image.
     if not record.get("write_strings"):
         del record["write_strings"]
     return record
@@ -111,15 +92,9 @@ def _serialize(stream: StreamConfig) -> dict:
 
 def save_streams(streams: List[StreamConfig]):
     path = _config_path()
-    # Written beside the target and renamed over it, never opened in place: `open(path, "w")`
-    # truncates before the first byte is serialized, so an exception mid-dump, a full disk or a
-    # killed container leaves a half-written streams.json — and this file is the ONLY copy of every
-    # stream's MQTT and InfluxDB credentials, with no database and no environment fallback behind
-    # it. load_streams() reports a damaged file as an empty one, so the next save would then write
-    # `[]` over it and make the loss permanent.
-    # The temporary file sits in the same directory because os.replace() is only atomic within a
-    # single filesystem; across one it degrades to copy-and-delete, which is the same truncation
-    # window again.
+    # Written beside the target and renamed over it: `open(path, "w")` truncates first, so a failed
+    # dump would leave a half-written file that load_streams() reads as empty and the next save
+    # overwrites. Same directory, because os.replace() is atomic only within one filesystem.
     tmp = path + ".tmp"
     try:
         with open(tmp, "w") as f:
@@ -127,12 +102,7 @@ def save_streams(streams: List[StreamConfig]):
             f.flush()
             os.fsync(f.fileno())
         os.replace(tmp, path)
-        # fsync of the file made its CONTENTS durable; the rename is a change to the DIRECTORY and
-        # is not durable until the directory itself is synced. Lose power in the window between the
-        # two and the filesystem can come back with the old streams.json, or with neither name
-        # pointing at the new data — and this file has no backup and no second copy. Against a
-        # SIGKILL of the container it makes no difference (the page cache survives the process);
-        # against the host losing power it is the difference between a saved config and a lost one.
+        # The rename changes the directory, which survives a power cut only once it is synced too.
         _fsync_directory(os.path.dirname(path))
     except BaseException:
         # Without this the partial temp file survives every failure and accumulates in DATA_DIR.

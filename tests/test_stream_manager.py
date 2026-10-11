@@ -1,22 +1,9 @@
 #!/usr/bin/env python3
-"""`StreamManager` — the object that owns every running processor and every websocket queue.
+"""`StreamManager`: the running processors and the websocket queues.
 
-Two things live here. The lifecycle half (start/stop/restart/stop_all) is what the REST endpoints
-call, and its invariants are all about not leaving a second processor behind: a stream whose task
-outlives its dictionary entry keeps its MQTT subscription open, keeps writing points, and is
-reachable by nothing in the UI. The fan-out half (`_broadcast` and the ws queues) is what puts
-events on the dashboard, and its invariant is that one stalled browser tab must not cost the others
-their feed.
-
-`is_running()` is asked of the processor's task rather than of the dictionary, because the manager
-never removes a processor whose task died on its own — `stop_stream()` is the only thing that pops
-the dictionary — so "the key is there" and "the stream is running" are different questions and
-GET /api/streams answers with the second one.
-
-Every test here builds its own StreamManager rather than using the module singleton: the autouse
-`no_live_processors` fixture in conftest.py fails any test that leaves a processor in the singleton,
-and rightly so. The lifecycle tests additionally replace `StreamProcessor` with a double, because
-the real one schedules a task that dials the broker named in the config.
+Every test builds its own StreamManager: conftest.py's `no_live_processors` fails a test that
+leaves a processor in the singleton. The lifecycle tests replace `StreamProcessor` with a double,
+because the real one dials the broker named in the config.
 """
 
 import asyncio
@@ -77,8 +64,7 @@ async def test_is_running_is_false_once_the_processor_task_has_died(monkeypatch)
     with suppress(RuntimeError):
         await proc._task
 
-    # The entry is still there, and nothing will ever remove it. That is the state in which the API
-    # used to keep reporting running: true for a stream that had stopped writing points.
+    # The entry is still there, and nothing will remove it.
     assert proc.cfg.id in mgr._processors
     assert mgr.is_running(proc.cfg.id) is False
 
@@ -86,12 +72,7 @@ async def test_is_running_is_false_once_the_processor_task_has_died(monkeypatch)
 # ── the lifecycle, against a processor that opens nothing ─────────────────────────────────────────
 
 class ProcessorLog:
-    """What the manager did, in the order it did it.
-
-    Order is the whole point of several tests below — "stopped the old processor" and "stopped the
-    old processor before constructing its replacement" are different claims, and only a sequence can
-    tell them apart.
-    """
+    """What the manager did, in order: several tests assert the sequence, not just the calls."""
 
     def __init__(self):
         self.events = []     # ("new" | "start" | "stop", stream_id), in call order
@@ -100,12 +81,10 @@ class ProcessorLog:
 
 @pytest.fixture
 def processors(monkeypatch):
-    """Replace `StreamProcessor` with a recorder for the duration of one test.
+    """Replace `StreamProcessor` with a recorder for one test.
 
-    `StreamManager.start_stream` constructs the processor itself, so this is patched on the
-    stream_manager module rather than injected: there is no seam to pass a factory through, and the
-    real constructor is followed immediately by `.start()`, which schedules a task that connects to
-    whatever `mqtt_host` says.
+    Patched on the stream_manager module: `start_stream` constructs the processor itself, and the
+    real one's `.start()` connects to whatever `mqtt_host` says.
     """
     log = ProcessorLog()
 
@@ -135,12 +114,10 @@ def _cfg(stream_id="s1", **overrides):
 
 
 async def test_start_stream_builds_a_processor_for_the_config_starts_it_and_keeps_it(processors):
-    """Registering without starting, or starting without registering, both look fine from the API.
+    """start_stream builds a processor for the config, registers it and starts it.
 
-    A processor that is constructed and registered but never started leaves `POST .../start`
-    answering `{"ok": true}` for a stream that connects to nothing. One that is started but not
-    registered runs with nobody holding a reference: `stop_stream` cannot find it, `stop_all` walks
-    past it, and it keeps its MQTT subscription until the process ends.
+    Registered but not started, the stream connects to nothing; started but not registered, nothing
+    can stop it.
     """
     mgr = StreamManager()
     cfg = _cfg()
@@ -154,11 +131,7 @@ async def test_start_stream_builds_a_processor_for_the_config_starts_it_and_keep
 
 
 async def test_the_processor_is_wired_to_the_managers_own_broadcast(processors):
-    """The processor's `on_event` is the only path from a flush to a browser.
-
-    Wire it to anything else — a stub, a logger, a fresh manager — and the bridge keeps working
-    perfectly while the dashboard's live log stays empty forever.
-    """
+    """The processor's `on_event` is the manager's `_broadcast`, the only path to a browser."""
     mgr = StreamManager()
 
     await mgr.start_stream(_cfg())
@@ -167,12 +140,10 @@ async def test_the_processor_is_wired_to_the_managers_own_broadcast(processors):
 
 
 async def test_starting_a_stream_that_is_already_running_stops_the_old_one_first(processors):
-    """Without the guard the dictionary entry is simply overwritten — and the old task survives it.
+    """Starting a running stream stops the old processor before building the new one.
 
-    Nothing else holds a reference to the displaced processor, so nothing can ever stop it: it keeps
-    its MQTT subscription and keeps writing the same points as its replacement, duplicating every
-    series for as long as the process lives. `POST /api/streams/{id}/start` pressed twice in the UI
-    is all it takes.
+    Merely overwritten, the old processor keeps its subscription, duplicates every point, and has
+    no reference left to stop it by.
     """
     mgr = StreamManager()
 
@@ -189,9 +160,7 @@ async def test_starting_a_stream_that_is_already_running_stops_the_old_one_first
 
 
 async def test_stop_stream_stops_the_processor_and_forgets_it(processors):
-    """Forgetting it is what lets the same id be started again; stopping it is what closes the
-    subscription. Doing one without the other leaves either a leaked task or an id that can never
-    be restarted without a container restart."""
+    """Stopping closes the subscription; forgetting lets the same id start again."""
     mgr = StreamManager()
     await mgr.start_stream(_cfg())
     processors.events.clear()
@@ -203,11 +172,9 @@ async def test_stop_stream_stops_the_processor_and_forgets_it(processors):
 
 
 async def test_stopping_a_stream_that_is_not_running_is_a_no_op(processors):
-    """`POST /api/streams/{id}/stop` does not check first, and `DELETE` calls this unconditionally.
+    """`DELETE` calls stop_stream unconditionally, and a disabled stream was never started.
 
-    Most streams in a config are disabled and were therefore never started, so deleting one is the
-    ordinary case — not an edge case. A KeyError here would turn every such delete into a 500 with
-    the record still on disk.
+    A KeyError here would turn each such delete into a 500 with the record still on disk.
     """
     mgr = StreamManager()
 
@@ -218,9 +185,8 @@ async def test_stopping_a_stream_that_is_not_running_is_a_no_op(processors):
 
 
 async def test_restart_stream_takes_the_stream_down_and_brings_it_back_when_it_is_enabled(processors):
-    """This is what `PUT /api/streams/{id}` calls, and an edit that does not restart is an edit that
-    does not apply: the running processor holds its own copy of the config, so a changed topic or a
-    changed broker address would sit on disk while the old connection carried on unchanged."""
+    """`PUT /api/streams/{id}` calls this: the running processor holds its own copy of the config,
+    so an edit applies only through a restart."""
     mgr = StreamManager()
     await mgr.start_stream(_cfg())
     processors.events.clear()
@@ -232,12 +198,7 @@ async def test_restart_stream_takes_the_stream_down_and_brings_it_back_when_it_i
 
 
 async def test_restarting_a_disabled_stream_takes_it_down_and_leaves_it_down(processors):
-    """Clearing the "enabled" checkbox and saving is the only way to switch a stream off.
-
-    If `restart_stream` started it again regardless, the UI would show the stream disabled, the
-    config on disk would say disabled, and the bridge would keep publishing to InfluxDB — with the
-    restart having refreshed the credentials from a record its owner had just turned off.
-    """
+    """Clearing "enabled" and saving switches a stream off, so a restart leaves it down."""
     mgr = StreamManager()
     await mgr.start_stream(_cfg(enabled=True))
     processors.events.clear()
@@ -259,13 +220,9 @@ async def test_restarting_a_stream_that_was_not_running_just_starts_it(processor
 
 
 async def test_stop_all_stops_every_stream_and_empties_the_registry(processors):
-    """Called from the lifespan's shutdown, which is the container's last chance to flush.
+    """stop_all stops every stream: the stop is what sends a processor's final batch.
 
-    Leaving its message loop is what makes a processor flush — `_connect_and_process` does it from a
-    `finally`, without the retry ladder — and the cancellation `stop()` delivers is what makes it
-    leave. So a stream this loop skips never flushes at all and loses whatever was in its batch, up
-    to BATCH_SIZE points, on every deploy. The iteration is over `list(self._processors)` because
-    `stop_stream` mutates the dictionary it would otherwise be walking.
+    It iterates over a copy, because `stop_stream` mutates the dictionary.
     """
     mgr = StreamManager()
     for stream_id in ("a", "b", "c"):
@@ -279,25 +236,11 @@ async def test_stop_all_stops_every_stream_and_empties_the_registry(processors):
 
 
 async def test_stop_all_takes_every_stream_down_at_the_same_time(monkeypatch):
-    """Serialised, the first stream in the dictionary spends the whole grace period on its own.
+    """stop_all stops the streams concurrently, not one after another.
 
-    Each `stop()` cancels a processor and waits for its final flush, and that flush can sit out
-    aiohttp's 10s timeout against an InfluxDB that has stopped answering — which is precisely the
-    situation in which the batches still in memory matter most. One after another, with docker's
-    stop grace period ticking, the streams behind the first one are killed with their batches
-    unwritten.
-
-    The doubles here block until all three have entered `stop()`, so a serialised `stop_all` cannot
-    finish at all: the first one waits for a signal only the third can send.
-
-    WHERE THE BOUND LIVES IS THE TEST. The rendezvous used to be `wait_for(..., timeout=2)` inside
-    the double, and that made the whole thing pass on a `for sid in ...: await self.stop_stream(sid)`
-    that swallowed exceptions — the obvious "simplification", and one the neighbouring test about
-    tolerating a failure invites: each stop simply waited out its own two seconds, the loop finished
-    in six, and both assertions below held. A serialised implementation must not have an escape
-    hatch, so the doubles now wait unbounded and the bound sits on the caller instead. Cancelled
-    from there, a stop_all that cannot finish fails as a TimeoutError on this test's own line rather
-    than by hanging the suite — there is no per-test timeout plugin in this project.
+    Each double blocks until all three have entered stop(), so a serialised stop_all cannot finish.
+    The doubles wait unbounded and the bound sits on the caller: a bound inside them would let a
+    serialised loop pass slowly, and with none at all the suite would hang.
     """
     total = 3
     entered = []
@@ -328,12 +271,10 @@ async def test_stop_all_takes_every_stream_down_at_the_same_time(monkeypatch):
 
 
 async def test_one_stream_failing_on_the_way_down_does_not_keep_the_others_from_stopping(monkeypatch):
-    """`stop_all` runs from the lifespan's shutdown and is the last thing that happens.
+    """A stop() that raises does not keep the other streams from stopping.
 
-    A processor whose `stop()` raises — a writer session already closed, a task that died holding
-    something — must not abort the shutdown of the streams gathered alongside it: they would be
-    killed with their final flush never attempted. The registry has to end up empty either way,
-    because `stop_stream` removes the entry before it stops anything and nothing else ever will.
+    They would be killed with their final flush never attempted. The registry ends up empty either
+    way, because `stop_stream` removes the entry before it stops anything.
     """
     stopped = []
 
@@ -364,12 +305,7 @@ async def test_one_stream_failing_on_the_way_down_does_not_keep_the_others_from_
 # ── stats ─────────────────────────────────────────────────────────────────────────────────────────
 
 async def test_get_all_stats_reports_one_entry_per_running_stream(processors):
-    """`GET /api/stats` and the websocket snapshot are both this list, unmodified.
-
-    A manager that returned the processors themselves, or a list of ids, would fail at JSON
-    serialisation; one that returned only the first, or deduplicated by name, would quietly hide
-    streams from the only screen that shows whether they are writing.
-    """
+    """`GET /api/stats` and the websocket snapshot are this list: one stats dict per stream."""
     mgr = StreamManager()
     await mgr.start_stream(_cfg("a"))
     await mgr.start_stream(_cfg("b"))
@@ -396,11 +332,7 @@ async def test_get_stats_answers_for_one_stream_and_returns_an_empty_dict_for_an
 # ── the websocket fan-out ─────────────────────────────────────────────────────────────────────────
 
 async def test_a_broadcast_reaches_every_connected_queue():
-    """Every open dashboard has its own queue and all of them have to see the same event.
-
-    Delivering to one — `next(iter(...))`, an early `return` inside the loop — is invisible with a
-    single tab open and looks like a flaky UI with two.
-    """
+    """Every open dashboard has its own queue, and every queue gets the event."""
     mgr = StreamManager()
     first, second = asyncio.Queue(), asyncio.Queue()
     mgr.add_ws_queue(first)
@@ -414,10 +346,9 @@ async def test_a_broadcast_reaches_every_connected_queue():
 
 
 async def test_a_removed_queue_stops_receiving():
-    """`websocket_endpoint` removes its queue in a `finally`, and this is why it has to.
+    """A removed queue receives nothing more.
 
-    A queue left behind after its socket closed is never drained again: it fills to its 500-message
-    maximum and then sits there, one per closed tab, for the lifetime of the process.
+    `websocket_endpoint` removes its queue in a `finally`.
     """
     mgr = StreamManager()
     q = asyncio.Queue()
@@ -431,12 +362,10 @@ async def test_a_removed_queue_stops_receiving():
 
 
 async def test_a_client_that_stopped_reading_is_dropped_without_taking_the_others_with_it():
-    """A stalled reader is the normal failure here — a laptop asleep with the dashboard open.
+    """A full queue is dropped, and the broadcast still reaches the others.
 
-    Its queue fills, and from then on every broadcast raises QueueFull for it. Letting that
-    exception escape would abort the fan-out partway through a set whose iteration order is
-    arbitrary, so a healthy tab would stop receiving events because a different tab's owner shut
-    their lid. Dropping the queue is also what keeps the set from growing without bound.
+    A stalled reader (a laptop asleep with the dashboard open) is the normal failure here; letting
+    QueueFull escape would stop the fan-out partway through the set.
     """
     mgr = StreamManager()
     stalled = asyncio.Queue(maxsize=1)
@@ -453,12 +382,9 @@ async def test_a_client_that_stopped_reading_is_dropped_without_taking_the_other
 
 
 async def test_a_queue_already_dropped_for_being_full_can_still_be_removed():
-    """These two paths overlap in production, which is why removal has to be a `discard`.
+    """A queue `_broadcast` already dropped can still be removed by the websocket handler.
 
-    `_broadcast` drops an overflowing queue from the set on its own, and the websocket handler then
-    removes the same queue again from its `finally` when the socket closes. `set.remove` would raise
-    KeyError there — inside a finally, in a task nobody awaits, so the traceback goes to the log and
-    the handler's remaining cleanup never runs.
+    Removal is a `discard`: `set.remove` would raise KeyError out of the handler's `finally`.
     """
     mgr = StreamManager()
     q = asyncio.Queue(maxsize=1)

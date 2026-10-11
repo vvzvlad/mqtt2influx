@@ -41,28 +41,18 @@ app = FastAPI(title="mqtt2influx", lifespan=lifespan)
 # ── REST: streams ──────────────────────────────────────────────────────────────
 
 def _validate_value_precision(body: dict):
-    """Refuse a `value_precision` that is not an integer, at the edge, before anything is stored.
+    """Refuse a `value_precision` that is not an integer, before anything is stored.
 
-    `StreamConfig` is a plain dataclass and `StreamConfig(**body)` checks no types at all, so
-    without this a `{"value_precision": "8"}` was answered with 200, written to streams.json and
-    echoed back by GET and by the UI — while the stream itself went on rounding to the default two
-    decimals, because `resolve_value_precision()` rejects the string. That fallback is the right
-    answer for a file that is ALREADY wrong (it keeps the stream writing rather than killing it),
-    and the wrong answer for a request that can still be refused. A precision that is quietly
-    ignored is exactly the bug this setting exists to fix, so the request is the place to say no.
-
-    An absent key and an explicit null are both "not configured" and are both accepted — see
-    `_serialize()` in config.py and `resolve_value_precision()` for why those two spellings must
-    stay interchangeable.
+    `StreamConfig(**body)` checks no types, and resolve_value_precision() falls back to the
+    default for a non-integer, so a bad value would be saved and shown while the stream ignores it.
+    An absent key and an explicit null both mean "not configured" and are accepted.
     """
     if "value_precision" not in body:
         return
     value = body["value_precision"]
     if value is None:
         return
-    # bool BEFORE int, because bool is a subclass of int: `isinstance(True, int)` is True, so
-    # without this line `{"value_precision": true}` would be accepted as a request for one decimal.
-    # Same ordering, and the same reason, as in resolve_value_precision().
+    # bool before int: bool is a subclass of int, and `true` would pass as one decimal.
     if isinstance(value, bool) or not isinstance(value, int):
         raise HTTPException(
             status_code=422,
@@ -72,18 +62,11 @@ def _validate_value_precision(body: dict):
 
 
 def _validate_write_strings(body: dict):
-    """Refuse a `write_strings` that is not a real bool, at the edge, before anything is stored.
+    """Refuse a `write_strings` that is not a real bool, before anything is stored.
 
-    `StreamConfig(**body)` checks no types at all and the processor resolves this field with
-    `bool(...)`, so every truthy non-bool is a silent yes: `"write_strings": "false"` — the obvious
-    spelling from a shell script or a hand-edited body — is a non-empty string and would switch a
-    production stream into writing string fields while the config, the GET and the UI checkbox all
-    read "false". InfluxDB fixes a field's type on the first write, so that mistake is not a
-    cosmetic one: the first string into a field that holds numbers makes the database refuse the
-    whole batch it arrived in.
-
-    An absent key is fine and means the default (off) — the same shape as `value_precision` above,
-    and what a curl one-liner that predates this feature sends.
+    The processor reads the field with bool(), so the string "false" would turn string fields on
+    while the config and the UI read "false"; the first string into a numeric field makes InfluxDB
+    refuse the whole batch. An absent key means the default, off.
     """
     if "write_strings" not in body:
         return
