@@ -16,13 +16,9 @@ help: ## Show this help
 		| awk 'BEGIN {FS = ":.*?## "}; {printf "  \033[36m%-12s\033[0m %s\n", $$1, $$2}'
 
 # --- Environment -------------------------------------------------------------
-# The project ALWAYS runs inside a local .venv, created automatically on first
-# use and reused after — the system Python is never used directly.
-# Note that pip is invoked as `python -m pip`, not as `.venv/bin/pip`: a venv
-# that was copied from another directory keeps the ORIGINAL absolute path in the
-# shebang of its console scripts, so `.venv/bin/pip` can quietly install into a
-# different project's environment. `python -m pip` always follows the
-# interpreter it is run with.
+# The project always runs inside a local .venv, created on first use.
+# pip runs as `python -m pip`: a copied venv's console scripts keep the original
+# absolute shebang and could install into another project's environment.
 .PHONY: venv
 venv: $(VENV)/bin/python ## Create the local virtualenv (.venv) if missing
 
@@ -37,15 +33,10 @@ $(VENV)/.deps-installed: requirements-dev.txt requirements.txt | $(VENV)/bin/pyt
 .PHONY: install
 install: $(VENV)/.deps-installed ## Create .venv (if missing) and install dev/test deps
 
-# Guarded by `test -f` rather than written unconditionally: .env is where a developer's own
-# DATA_DIR and batching values live, and an unguarded `cp` would silently overwrite them every time
-# this target ran as a dependency of something else.
-#
-# The file IS read automatically by the application: src/settings.py names `.env` in its
-# SettingsConfigDict and pydantic-settings brings python-dotenv in to read it, so `make run` picks
-# it up with nothing else to do. A real environment variable still beats it. TZ is the exception —
-# nothing in src/ reads it, so it only takes effect if the shell exports it. The test suite
-# deliberately ignores the file entirely; see the `no_dotenv` fixture in tests/conftest.py.
+# Guarded by `test -f` so an existing .env is never overwritten.
+# src/settings.py reads .env at startup (a real environment variable wins); TZ is read by
+# nothing in src/, so it only applies if the shell exports it. The test suite ignores .env
+# (the `no_dotenv` fixture in tests/conftest.py).
 .PHONY: env
 env: ## Create .env from .env.example if it does not exist yet
 	@test -f .env || cp .env.example .env

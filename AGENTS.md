@@ -28,8 +28,7 @@ why it is never skipped.
 - `entrypoint.sh` — the image's ENTRYPOINT: starts as root, creates and chowns `"$DATA_DIR"`
   (default `/app/data`), then `exec`s gosu to drop to uid 1000. `exec` in both branches, so the
   python process is PID 1 and gets SIGTERM
-- `CLAUDE.md` — one line, `@AGENTS.md`. Claude Code reads only `CLAUDE.md`, so that import is what
-  puts this file in its context; keep it an import, not a copy or a symlink
+- `CLAUDE.md` — one line, `@AGENTS.md`; keep it an import, not a copy or a symlink
 
 ## Setup
 All routine actions go through the `Makefile` — run `make help` to list targets.
@@ -41,12 +40,8 @@ make env       # copy .env.example to .env if it is not there yet
 at startup and a real environment variable wins over it; `.env` never reaches the image
 (`.dockerignore`) or the CI test container (excluded from the tar).
 
-## Running tests
-```bash
-make test
-```
-
-## Running the app
+## Tests and local run
+Tests run in CI (see below); `make test` runs the same pytest suite.
 ```bash
 make run       # http://127.0.0.1:8000, DATA_DIR defaults to /app/data — override it locally
 ```
@@ -116,3 +111,12 @@ Rules worth knowing before editing either:
   reads the CRUD cycle's result off the container's disk rather than trusting the API's echo.
 - A push of `:latest` deploys itself: the production container carries
   `io.portainer.update.enable`, so an updater picks it up with nobody in the loop.
+
+## Limits for agents
+- Tests: at most three times the code (`wc -l` of `tests/` against the code). Over the limit,
+  still write the test you need, and in the same change go through the old tests: drop or merge
+  duplicates and tests of implementation rather than behaviour.
+- Comments explain the code as it is and why it is built this way. History ("used to", "after
+  the review", "since the incident") goes into the commit message.
+- This file stays under ~150 lines: only what an agent would get wrong without it. No decision
+  history, incident logs or retelling of the code.
